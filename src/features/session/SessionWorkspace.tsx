@@ -1,5 +1,7 @@
 import {
   AudioWaveform,
+  ChevronLeft,
+  ChevronRight,
   Drum,
   Guitar,
   Mic,
@@ -16,66 +18,20 @@ import type { ComponentType } from 'react'
 import { Panel } from '../../components/ui/Panel'
 import { cn } from '../../components/ui/cn'
 import { useLaunchBrainStore } from '../../store/useLaunchBrainStore'
+import { LAYOUT_PRESET_NAMES } from '../../data/trackRoles'
+import { ALL_MUSICAL_KEYS } from '../../utils/musicTheory'
+import type { LayoutPresetName, TrackIconName } from '../../types'
 
-const TRACK_ICONS: ComponentType<{ className?: string }>[] = [
-  Drum,
-  Music2,
-  AudioWaveform,
-  Piano,
-  Radio,
-  Guitar,
-  Mic,
-  Sparkles,
-]
-
-const TRACK_COLUMN_LABELS = [
-  'Drum',
-  'Drum 2 / Hats',
-  'Bass',
-  'Instrument / Chord',
-  'Melody',
-  'Guitar / Texture',
-  'Vocal',
-  'FX',
-]
-
-const AUTO_FILL_KEY_OPTIONS = [
-  'Auto',
-  'C Major',
-  'C Minor',
-  'C# Major',
-  'C# Minor',
-  'Db Major',
-  'Db Minor',
-  'D Major',
-  'D Minor',
-  'D# Major',
-  'D# Minor',
-  'Eb Major',
-  'Eb Minor',
-  'E Major',
-  'E Minor',
-  'F Major',
-  'F Minor',
-  'F# Major',
-  'F# Minor',
-  'Gb Major',
-  'Gb Minor',
-  'G Major',
-  'G Minor',
-  'G# Major',
-  'G# Minor',
-  'Ab Major',
-  'Ab Minor',
-  'A Major',
-  'A Minor',
-  'A# Major',
-  'A# Minor',
-  'Bb Major',
-  'Bb Minor',
-  'B Major',
-  'B Minor',
-]
+const TRACK_ICON_MAP: Record<TrackIconName, ComponentType<{ className?: string }>> = {
+  drum: Drum,
+  hats: Music2,
+  bass: AudioWaveform,
+  instrument: Piano,
+  melody: Radio,
+  guitar: Guitar,
+  vocal: Mic,
+  fx: Sparkles,
+}
 
 export function SessionWorkspace() {
   const [contextMenu, setContextMenu] = useState<
@@ -89,17 +45,29 @@ export function SessionWorkspace() {
     | null
   >(null)
   const [dragOverClipId, setDragOverClipId] = useState<string | null>(null)
+  const [manualKeyModal, setManualKeyModal] = useState<{
+    sampleId: string
+    key: string
+  } | null>(null)
 
   const scenes = useLaunchBrainStore((state) => state.scenes)
   const tracks = useLaunchBrainStore((state) => state.tracks)
   const clips = useLaunchBrainStore((state) => state.clips)
   const samples = useLaunchBrainStore((state) => state.samples)
+  const activePack = useLaunchBrainStore((state) => state.activePack)
+  const activeCategoryFilter = useLaunchBrainStore((state) => state.activeCategoryFilter)
+  const activeBpmFilter = useLaunchBrainStore((state) => state.activeBpmFilter)
+  const activeTypeFilter = useLaunchBrainStore((state) => state.activeTypeFilter)
+  const browserQuery = useLaunchBrainStore((state) => state.browserQuery)
   const selectedClipId = useLaunchBrainStore((state) => state.selectedClipId)
   const selectedSampleId = useLaunchBrainStore((state) => state.selectedSampleId)
   const autoFillSettings = useLaunchBrainStore((state) => state.autoFillSettings)
   const autoFillOptionsOpen = useLaunchBrainStore((state) => state.autoFillOptionsOpen)
   const autoFillResolvedSource = useLaunchBrainStore((state) => state.autoFillResolvedSource)
+  const autoFillResolvedSourceReason = useLaunchBrainStore((state) => state.autoFillResolvedSourceReason)
+  const autoFillResolvedKey = useLaunchBrainStore((state) => state.autoFillResolvedKey)
   const autoFillCoverageLabel = useLaunchBrainStore((state) => state.autoFillCoverageLabel)
+  const layoutPresetName = useLaunchBrainStore((state) => state.layoutPresetName)
   const canUndoClear = useLaunchBrainStore((state) => state.canUndoClear)
 
   const selectClip = useLaunchBrainStore((state) => state.selectClip)
@@ -114,6 +82,10 @@ export function SessionWorkspace() {
   const stopTrack = useLaunchBrainStore((state) => state.stopTrack)
   const setAutoFillSettings = useLaunchBrainStore((state) => state.setAutoFillSettings)
   const toggleAutoFillOptions = useLaunchBrainStore((state) => state.toggleAutoFillOptions)
+  const applyLayoutPreset = useLaunchBrainStore((state) => state.applyLayoutPreset)
+  const moveTrackColumnLeft = useLaunchBrainStore((state) => state.moveTrackColumnLeft)
+  const moveTrackColumnRight = useLaunchBrainStore((state) => state.moveTrackColumnRight)
+  const resetTrackOrder = useLaunchBrainStore((state) => state.resetTrackOrder)
   const assignSampleToClip = useLaunchBrainStore((state) => state.assignSampleToClip)
   const clearClip = useLaunchBrainStore((state) => state.clearClip)
   const clearRow = useLaunchBrainStore((state) => state.clearRow)
@@ -122,10 +94,59 @@ export function SessionWorkspace() {
   const removeMissingClips = useLaunchBrainStore((state) => state.removeMissingClips)
   const undoLastClear = useLaunchBrainStore((state) => state.undoLastClear)
   const clearSelectedClip = useLaunchBrainStore((state) => state.clearSelectedClip)
+  const analyzeKeyForSample = useLaunchBrainStore((state) => state.analyzeKeyForSample)
+  const setSampleManualKey = useLaunchBrainStore((state) => state.setSampleManualKey)
+  const markSampleKeyUnknown = useLaunchBrainStore((state) => state.markSampleKeyUnknown)
+  const setSampleAsProjectKey = useLaunchBrainStore((state) => state.setSampleAsProjectKey)
+  const toggleSampleExcludedInAutoFill = useLaunchBrainStore(
+    (state) => state.toggleSampleExcludedInAutoFill,
+  )
+  const showSampleMetadata = useLaunchBrainStore((state) => state.showSampleMetadata)
 
   const sampleById = useMemo(() => {
     return new Map(samples.map((sample) => [sample.id, sample]))
   }, [samples])
+  const keyScopeSamples = useMemo(() => {
+    const query = browserQuery.trim().toLowerCase()
+
+    return samples.filter((sample) => {
+      const samplePack = sample.relativePath.split(/[\\/]/)[0] || 'Root'
+      const matchesPack = !activePack || samplePack === activePack
+      const matchesCategory = !activeCategoryFilter || sample.category === activeCategoryFilter
+      const matchesBpm =
+        activeBpmFilter === null || (sample.detectedBpm ?? sample.bpm) === activeBpmFilter
+      const matchesType = !activeTypeFilter || sample.type === activeTypeFilter
+      const matchesQuery =
+        query.length === 0 ||
+        sample.filename.toLowerCase().includes(query) ||
+        sample.relativePath.toLowerCase().includes(query) ||
+        sample.tags.some((tag) => tag.toLowerCase().includes(query))
+
+      return matchesPack && matchesCategory && matchesBpm && matchesType && matchesQuery
+    })
+  }, [activeBpmFilter, activeCategoryFilter, activePack, activeTypeFilter, browserQuery, samples])
+  const detectedKeyEntries = useMemo(() => {
+    const counts = new Map<string, number>()
+
+    for (const sample of keyScopeSamples) {
+      const value = sample.normalizedKey ?? sample.key
+      if (!value) {
+        continue
+      }
+
+      counts.set(value, (counts.get(value) ?? 0) + 1)
+    }
+
+    return [...counts.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+  }, [keyScopeSamples])
+  const detectedKeyValues = useMemo(() => new Set(detectedKeyEntries.map(([key]) => key)), [detectedKeyEntries])
+  const fallbackKeyOptions = useMemo(
+    () => ALL_MUSICAL_KEYS.filter((key) => !detectedKeyValues.has(key)),
+    [detectedKeyValues],
+  )
+  const contextClip = contextMenu ? clips.find((clip) => clip.id === contextMenu.clipId) ?? null : null
+  const contextSample =
+    contextClip?.sampleId ? sampleById.get(contextClip.sampleId) ?? null : null
 
   useEffect(() => {
     const closeMenu = () => setContextMenu(null)
@@ -240,6 +261,30 @@ export function SessionWorkspace() {
                 </select>
               </label>
 
+              <div className="grid grid-cols-[1fr_auto] items-end gap-2">
+                <label className="space-y-1">
+                  <span className="panel-label">Layout Preset</span>
+                  <select
+                    value={layoutPresetName}
+                    onChange={(event) => applyLayoutPreset(event.target.value as LayoutPresetName)}
+                    className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-100 outline-none"
+                  >
+                    {LAYOUT_PRESET_NAMES.map((preset) => (
+                      <option key={preset} value={preset}>
+                        {preset}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  onClick={resetTrackOrder}
+                  className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-slate-300 transition hover:border-slate-500"
+                >
+                  Reset
+                </button>
+              </div>
+
               <div className="grid grid-cols-2 gap-2">
                 <label className="space-y-1">
                   <span className="panel-label">Target BPM</span>
@@ -285,11 +330,29 @@ export function SessionWorkspace() {
                   }
                   className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-100 outline-none"
                 >
-                  {AUTO_FILL_KEY_OPTIONS.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
+                  <option value="Auto">Auto</option>
+                  {detectedKeyEntries.length > 0 && (
+                    <optgroup
+                      label={
+                        activePack
+                          ? `Detected in ${activePack}`
+                          : 'Detected in current scope'
+                      }
+                    >
+                      {detectedKeyEntries.map(([key, count]) => (
+                        <option key={key} value={key}>
+                          {key} ({count})
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  <optgroup label="All keys">
+                    {fallbackKeyOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </optgroup>
                 </select>
               </label>
 
@@ -308,6 +371,28 @@ export function SessionWorkspace() {
                   <option value="compatible">Compatible</option>
                   <option value="strict">Strict</option>
                 </select>
+              </label>
+
+              <label className="flex items-center gap-2 text-xs text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={autoFillSettings.allowUnknownKeySamples}
+                  onChange={(event) =>
+                    setAutoFillSettings({ allowUnknownKeySamples: event.target.checked })
+                  }
+                />
+                Allow unknown key samples
+              </label>
+
+              <label className="flex items-center gap-2 text-xs text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={autoFillSettings.allowKeyNeutralStrict}
+                  onChange={(event) =>
+                    setAutoFillSettings({ allowKeyNeutralStrict: event.target.checked })
+                  }
+                />
+                Allow key-neutral drums/FX in strict mode
               </label>
 
               <label className="flex items-center gap-2 text-xs text-slate-300">
@@ -347,31 +432,67 @@ export function SessionWorkspace() {
         <span className="text-slate-500">Source:</span> {autoFillResolvedSource}
         <span className="ml-3 text-slate-500">Coverage:</span> {autoFillCoverageLabel}
         <span className="ml-3 text-slate-500">Target BPM:</span> {autoFillSettings.targetBpm ?? 'auto'}
-        <span className="ml-3 text-slate-500">Key:</span> {autoFillSettings.targetKey ?? 'auto'}
-        <span className="ml-3 text-slate-500">Mode:</span> {autoFillSettings.sourceScope}
+        <span className="ml-3 text-slate-500">Target Key:</span> {autoFillResolvedKey ?? 'auto'}
+        <span className="ml-3 text-slate-500">Key Mode:</span> {autoFillSettings.keyStrictness}
+        <span className="ml-3 text-slate-500">Layout:</span> {layoutPresetName}
+        {autoFillResolvedSourceReason ? (
+          <span className="ml-3 text-slate-500">{autoFillResolvedSourceReason}</span>
+        ) : null}
       </div>
 
       <div className="border-b border-slate-800/70 px-3 py-2">
         <div className="grid grid-cols-[68px_repeat(8,minmax(0,1fr))_56px] gap-1 text-[11px]">
           <div></div>
           {tracks.map((track, index) => {
-            const Icon = TRACK_ICONS[index]
+            const Icon = TRACK_ICON_MAP[track.icon] ?? Music2
 
             return (
-              <button
+              <div
                 key={track.id}
-                type="button"
-                onClick={() => selectTrack(track.id)}
                 className={cn(
-                  'flex items-center justify-center gap-1 rounded-md border border-slate-800 bg-slate-900 px-1 py-1.5 transition',
+                  'grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1 rounded-md border border-slate-800 bg-slate-900 px-1 py-1 transition',
                   track.selected && 'border-slate-500 bg-slate-800',
                 )}
               >
-                <span style={{ color: track.color }}>
-                  <Icon className="h-3.5 w-3.5" />
-                </span>
-                <span className="truncate text-slate-200">{TRACK_COLUMN_LABELS[index]}</span>
-              </button>
+                <button
+                  type="button"
+                  onClick={() => selectTrack(track.id)}
+                  className="flex min-w-0 items-center gap-1"
+                >
+                  <span style={{ color: track.color }}>
+                    <Icon className="h-3.5 w-3.5" />
+                  </span>
+                  <span className="truncate text-slate-200">{track.label}</span>
+                  {track.liveInput && (
+                    <span
+                      className="inline-flex items-center rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0 text-[9px] uppercase tracking-wide text-emerald-200"
+                      title="Future live input track: recording/capture coming later"
+                    >
+                      LIVE
+                    </span>
+                  )}
+                </button>
+                <div className="inline-flex items-center gap-0.5">
+                  <button
+                    type="button"
+                    onClick={() => moveTrackColumnLeft(index)}
+                    disabled={index === 0}
+                    className="rounded border border-slate-700 p-0.5 text-slate-300 transition hover:border-slate-500 disabled:opacity-35"
+                    aria-label={`Move ${track.label} column left`}
+                  >
+                    <ChevronLeft className="h-3 w-3" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => moveTrackColumnRight(index)}
+                    disabled={index === tracks.length - 1}
+                    className="rounded border border-slate-700 p-0.5 text-slate-300 transition hover:border-slate-500 disabled:opacity-35"
+                    aria-label={`Move ${track.label} column right`}
+                  >
+                    <ChevronRight className="h-3 w-3" />
+                  </button>
+                </div>
+              </div>
             )
           })}
           <div className="flex items-center justify-center text-slate-400">Scenes</div>
@@ -455,7 +576,7 @@ export function SessionWorkspace() {
                         }
                       }
 
-                      assignSampleToClip(slot.id, sampleId)
+                      void assignSampleToClip(slot.id, sampleId)
                       selectClip(slot.id)
                       setDragOverClipId(null)
                     }}
@@ -504,7 +625,7 @@ export function SessionWorkspace() {
                           )}
                         </div>
                         <p className="truncate text-[10px] text-slate-200">
-                          {slot.bpm ?? '--'} BPM - {slot.key ?? '--'}
+                          {slot.bpm ?? '--'} BPM - {slot.normalizedKey ?? slot.key ?? '--'}
                         </p>
                       </div>
                     ) : (
@@ -625,7 +746,7 @@ export function SessionWorkspace() {
                   return
                 }
               }
-              assignSampleToClip(contextMenu.clipId, selectedSampleId)
+              void assignSampleToClip(contextMenu.clipId, selectedSampleId)
               setContextMenu(null)
             }}
             className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800 disabled:opacity-40"
@@ -665,6 +786,158 @@ export function SessionWorkspace() {
           >
             Clear Column
           </button>
+
+          <div className="my-1 border-t border-slate-800" />
+
+          <button
+            type="button"
+            disabled={!contextSample}
+            onClick={() => {
+              if (!contextSample) {
+                return
+              }
+              void analyzeKeyForSample(contextSample.id)
+              setContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800 disabled:opacity-40"
+          >
+            Analyze Key
+          </button>
+
+          <button
+            type="button"
+            disabled={!contextSample}
+            onClick={() => {
+              if (!contextSample) {
+                return
+              }
+              setManualKeyModal({
+                sampleId: contextSample.id,
+                key: contextSample.normalizedKey ?? 'C Minor',
+              })
+              setContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800 disabled:opacity-40"
+          >
+            Set Key Manually
+          </button>
+
+          <button
+            type="button"
+            disabled={!contextSample}
+            onClick={() => {
+              if (!contextSample) {
+                return
+              }
+              void markSampleKeyUnknown(contextSample.id)
+              setContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800 disabled:opacity-40"
+          >
+            Mark Key Unknown
+          </button>
+
+          <button
+            type="button"
+            disabled={!contextSample?.normalizedKey}
+            onClick={() => {
+              if (!contextSample) {
+                return
+              }
+              setSampleAsProjectKey(contextSample.id)
+              setContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800 disabled:opacity-40"
+          >
+            Use This Key as Project Key
+          </button>
+
+          <button
+            type="button"
+            disabled={!contextSample}
+            onClick={() => {
+              if (!contextSample) {
+                return
+              }
+              void toggleSampleExcludedInAutoFill(contextSample.id, !contextSample.excluded)
+              setContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800 disabled:opacity-40"
+          >
+            {contextSample?.excluded ? 'Include In Current Auto Fill' : 'Exclude From Current Auto Fill'}
+          </button>
+
+          <button
+            type="button"
+            disabled={!contextSample}
+            onClick={() => {
+              if (!contextSample) {
+                return
+              }
+              showSampleMetadata(contextSample.id)
+              setContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800 disabled:opacity-40"
+          >
+            Show Metadata
+          </button>
+
+          <button
+            type="button"
+            disabled
+            title="Coming later: non-destructive pitch shifting / rendered tuned copy."
+            className="w-full cursor-not-allowed rounded px-2 py-1 text-left text-xs text-slate-500"
+          >
+            Transpose / Change Key to Project Key
+          </button>
+        </div>
+      )}
+
+      {manualKeyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-950 p-3">
+            <h4 className="text-sm font-semibold text-slate-100">Set Manual Key</h4>
+            <p className="mt-1 text-xs text-slate-400">Metadata override only. Audio is not transposed.</p>
+            <select
+              value={manualKeyModal.key}
+              onChange={(event) =>
+                setManualKeyModal((current) =>
+                  current
+                    ? {
+                        ...current,
+                        key: event.target.value,
+                      }
+                    : current,
+                )
+              }
+              className="mt-3 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 outline-none"
+            >
+              {ALL_MUSICAL_KEYS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setManualKeyModal(null)}
+                className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void setSampleManualKey(manualKeyModal.sampleId, manualKeyModal.key)
+                  setManualKeyModal(null)
+                }}
+                className="rounded border border-sky-500/40 bg-sky-500/15 px-2 py-1 text-xs text-sky-200"
+              >
+                Save Key
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </Panel>

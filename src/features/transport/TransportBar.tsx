@@ -346,7 +346,7 @@ export function TransportBar() {
           value={formatMidiLabel(devices.midi)}
           icon={<Usb className="h-3 w-3" />}
         />
-        <StatusBadge label="CPU (mock)" value="12%" icon={<Cpu className="h-3 w-3" />} />
+        <StatusBadge label="CPU (local)" value="12%" icon={<Cpu className="h-3 w-3" />} />
         <Disc3 className="h-4 w-4 text-slate-500" />
       </div>
     </header>

@@ -3,16 +3,22 @@ import {
   createDefaultScenes,
   createDefaultTracks,
   createEmptyClips,
+  DEFAULT_LAYOUT_PRESET,
   DEFAULT_ASSISTANT_MESSAGES,
   DEFAULT_DEVICES,
   DEFAULT_TRANSPORT,
-  TRACK_LABELS,
 } from '../data/uiDefaults'
 import {
+  TRACK_LAYOUT_PRESET_ORDER,
+  TRACK_ROLE_LIBRARY,
+} from '../data/trackRoles'
+import {
+  analyzeSampleKey as apiAnalyzeSampleKey,
   getConfig,
   getDevices,
   getFilesystemFolderList,
   getFilesystemRoots,
+  getSampleOverrides as apiGetSampleOverrides,
   loadSession as apiLoadSession,
   listSessions as apiListSessions,
   getSampleIndex,
@@ -20,8 +26,16 @@ import {
   scanSamples,
   saveSession as apiSaveSession,
   setSampleRoot,
+  upsertSampleOverride as apiUpsertSampleOverride,
 } from '../services/api'
 import { audioTransport, type TransportClipRequest } from '../services/audioTransport'
+import {
+  ALL_MUSICAL_KEYS,
+  areKeysCompatible,
+  areKeysExactMatch,
+  normalizeKey,
+  parseKey,
+} from '../utils/musicTheory'
 import type {
   AppConfig,
   AssistantMessage,
@@ -32,12 +46,16 @@ import type {
   FsFolderEntry,
   FsRootEntry,
   InspectorTab,
+  LayoutPresetName,
   SavedSessionSummary,
   SampleRecord,
+  SampleOverrideRecord,
   SampleType,
   Scene,
   SessionManifest,
   Track,
+  TrackRoleId,
+  TransportDiagnostics,
   TransportState,
 } from '../types'
 
@@ -89,7 +107,10 @@ interface LaunchBrainState {
   folderBrowserAudioFileCountRecursiveEstimate: number | null
   autoFillSettings: AutoFillSettings
   autoFillOptionsOpen: boolean
+  layoutPresetName: LayoutPresetName
   autoFillResolvedSource: string
+  autoFillResolvedSourceReason: string | null
+  autoFillResolvedKey: string | null
   clockProgress: number
   clockBeatInBar: number
   clockBeatInCycle: number
@@ -109,6 +130,8 @@ interface LaunchBrainState {
   } | null
   recentSessions: SavedSessionSummary[]
   selectedRecentSessionId: string | null
+  sampleOverrides: Record<string, SampleOverrideRecord>
+  transportDiagnostics: TransportDiagnostics
   initializeApp: () => Promise<void>
   refreshSavedSessions: () => Promise<void>
   saveCurrentSession: (saveAs?: boolean, nameOverride?: string | null) => Promise<void>
@@ -141,13 +164,23 @@ interface LaunchBrainState {
   clearLibraryFilters: () => void
   toggleExplorerGroup: (group: keyof LaunchBrainState['explorerGroupsOpen']) => void
   selectBrowserFile: (sampleId: string) => void
+  analyzeKeyForSample: (sampleId: string) => Promise<void>
+  setSampleManualKey: (sampleId: string, manualKey: string | null) => Promise<void>
+  markSampleKeyUnknown: (sampleId: string) => Promise<void>
+  setSampleAsProjectKey: (sampleId: string) => void
+  toggleSampleExcludedInAutoFill: (sampleId: string, excluded: boolean) => Promise<void>
+  showSampleMetadata: (sampleId: string) => void
   toggleSelectedSamplePreview: () => Promise<void>
   stopSamplePreview: () => void
-  assignSampleToClip: (clipId: string, sampleId: string) => void
-  loadSelectedFileToSelectedClip: () => void
-  loadSampleToSelectedClip: (sampleId: string) => void
+  assignSampleToClip: (clipId: string, sampleId: string) => Promise<void>
+  loadSelectedFileToSelectedClip: () => Promise<void>
+  loadSampleToSelectedClip: (sampleId: string) => Promise<void>
   setAutoFillSettings: (partial: Partial<AutoFillSettings>) => void
   toggleAutoFillOptions: () => void
+  applyLayoutPreset: (presetName: LayoutPresetName) => void
+  moveTrackColumnLeft: (trackIndex: number) => void
+  moveTrackColumnRight: (trackIndex: number) => void
+  resetTrackOrder: () => void
   autoFillGrid: () => void
   selectClip: (clipId: string) => void
   toggleClipPlayback: (clipId: string) => Promise<void>
@@ -173,45 +206,12 @@ interface LaunchBrainState {
   runAssistantQuickAction: (action: string) => void
 }
 
-const TRACK_CATEGORY_MAP = [
-  'Drums',
-  'Hats / Perc',
-  'Bass',
-  'Instrument / Chord',
-  'Melody',
-  'Guitar / Texture',
-  'Vocal',
-  'FX',
-] as const
+const DEFAULT_ROLE_ORDER = TRACK_LAYOUT_PRESET_ORDER[DEFAULT_LAYOUT_PRESET]
 
 const LOOP_CONFIDENCE_WEIGHT = {
   high: 3,
   medium: 2,
   low: 1,
-}
-
-const NOTE_TO_SEMITONE: Record<string, number> = {
-  C: 0,
-  'B#': 0,
-  'C#': 1,
-  DB: 1,
-  D: 2,
-  'D#': 3,
-  EB: 3,
-  E: 4,
-  FB: 4,
-  F: 5,
-  'E#': 5,
-  'F#': 6,
-  GB: 6,
-  G: 7,
-  'G#': 8,
-  AB: 8,
-  A: 9,
-  'A#': 10,
-  BB: 10,
-  B: 11,
-  CB: 11,
 }
 
 const DEFAULT_AUTO_FILL_SETTINGS: AutoFillSettings = {
@@ -220,6 +220,8 @@ const DEFAULT_AUTO_FILL_SETTINGS: AutoFillSettings = {
   bpmTolerance: 3,
   targetKey: null,
   keyStrictness: 'compatible',
+  allowUnknownKeySamples: true,
+  allowKeyNeutralStrict: true,
   preferLoops: true,
   allowOneShotsInFXOnly: true,
   preferSameFolder: true,
@@ -245,73 +247,258 @@ function getSamplePack(sample: SampleRecord): string {
   return pack && pack.length > 0 ? pack : 'Root'
 }
 
-function normalizeNote(note: string) {
-  return note.trim().toUpperCase()
+function getTrackLabel(tracks: Track[], trackIndex: number) {
+  return tracks[trackIndex]?.label ?? `Track ${trackIndex + 1}`
 }
 
-function parseKey(input: string | null) {
-  if (!input) {
-    return null
-  }
-
-  const noteMatch = input.match(/\b([A-G](?:#|b)?)\b/i)
-  if (!noteMatch) {
-    return null
-  }
-
-  const note = normalizeNote(noteMatch[1]).replace('B', 'B')
-  const modeMatch = input.match(/\b(major|minor|maj|min)\b/i)
-  const mode = modeMatch
-    ? modeMatch[1].toLowerCase().startsWith('min')
-      ? 'Minor'
-      : 'Major'
-    : null
-
-  return { note, mode }
+function getRoleOrderFromTracks(tracks: Track[]) {
+  return [...tracks]
+    .sort((left, right) => left.index - right.index)
+    .map((track) => track.role)
 }
 
-function semitoneDistance(left: string, right: string) {
-  const leftSemitone = NOTE_TO_SEMITONE[left]
-  const rightSemitone = NOTE_TO_SEMITONE[right]
-
-  if (leftSemitone === undefined || rightSemitone === undefined) {
-    return null
-  }
-
-  const diff = Math.abs(leftSemitone - rightSemitone)
-  return Math.min(diff, 12 - diff)
+const LEGACY_LABEL_TO_ROLE: Record<string, TrackRoleId> = {
+  Drum: 'drum',
+  'Drum 2 / Hats': 'drum2_hats',
+  Bass: 'bass',
+  'Instrument / Chord': 'instrument_chord',
+  Melody: 'melody',
+  'Guitar / Texture': 'guitar_texture',
+  Vocal: 'vocal',
+  FX: 'fx',
 }
 
-function getKeyCompatibility(sampleKey: string | null, targetKey: string | null) {
-  const parsedSample = parseKey(sampleKey)
-  const parsedTarget = parseKey(targetKey)
-
-  if (!parsedSample || !parsedTarget) {
-    return 0
+function inferRoleFromLegacyTrack(track: Partial<Track>): TrackRoleId | null {
+  if (track.role && TRACK_ROLE_LIBRARY[track.role]) {
+    return track.role
   }
 
-  if (parsedSample.note === parsedTarget.note) {
-    if (parsedSample.mode && parsedTarget.mode && parsedSample.mode === parsedTarget.mode) {
-      return 1
+  const fromLabel = track.label ? LEGACY_LABEL_TO_ROLE[track.label] : null
+  return fromLabel ?? null
+}
+
+function normalizeRoleOrderFromLoadedTracks(loadedTracks: Partial<Track>[] | null | undefined) {
+  if (!loadedTracks || loadedTracks.length === 0) {
+    return [...DEFAULT_ROLE_ORDER]
+  }
+
+  const sorted = [...loadedTracks].sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
+  const seen = new Set<TrackRoleId>()
+  const roleOrder: TrackRoleId[] = []
+
+  for (const track of sorted) {
+    const role = inferRoleFromLegacyTrack(track)
+    if (!role || seen.has(role)) {
+      continue
     }
-
-    return 0.8
+    seen.add(role)
+    roleOrder.push(role)
   }
 
-  const distance = semitoneDistance(parsedSample.note, parsedTarget.note)
-  if (distance === null) {
-    return 0
+  for (const role of DEFAULT_ROLE_ORDER) {
+    if (!seen.has(role)) {
+      roleOrder.push(role)
+    }
   }
 
-  if (distance === 5 || distance === 7) {
-    return 0.55
+  return roleOrder.slice(0, DEFAULT_ROLE_ORDER.length)
+}
+
+function inferLayoutPresetName(roleOrder: TrackRoleId[]): LayoutPresetName {
+  for (const [presetName, presetOrder] of Object.entries(TRACK_LAYOUT_PRESET_ORDER)) {
+    const matches =
+      presetOrder.length === roleOrder.length &&
+      presetOrder.every((role, index) => roleOrder[index] === role)
+
+    if (matches) {
+      return presetName as LayoutPresetName
+    }
   }
 
-  if (distance === 3 || distance === 4 || distance === 8 || distance === 9) {
-    return 0.45
+  return DEFAULT_LAYOUT_PRESET
+}
+
+function buildTracksFromRoleOrderWithState(currentTracks: Track[], roleOrder: TrackRoleId[]) {
+  const trackByRole = new Map(currentTracks.map((track) => [track.role, track]))
+  const selectedRole = currentTracks.find((track) => track.selected)?.role ?? roleOrder[0] ?? null
+
+  return roleOrder.map((role, index) => {
+    const definition = TRACK_ROLE_LIBRARY[role]
+    const existing = trackByRole.get(role)
+
+    return {
+      id: `track-${index + 1}`,
+      index,
+      role: definition.role,
+      label: definition.label,
+      shortLabel: definition.shortLabel,
+      color: definition.color,
+      icon: definition.icon,
+      acceptedCategories: [...definition.acceptedCategories],
+      preferredTypes: [...definition.preferredTypes],
+      keyNeutral: definition.keyNeutral,
+      liveInput: definition.liveInput,
+      inputType: definition.inputType,
+      futureDevice: definition.futureDevice,
+      allowOneShots: definition.allowOneShots,
+      launchRule: definition.launchRule,
+      hardwareColumnIndex: index,
+      armed: existing?.armed ?? false,
+      muted: existing?.muted ?? false,
+      solo: existing?.solo ?? false,
+      selected: role === selectedRole,
+    }
+  })
+}
+
+function remapClipsForRoleOrder(
+  clips: ClipSlot[],
+  currentTracks: Track[],
+  nextTracks: Track[],
+) {
+  const clipByCell = new Map<string, ClipSlot>()
+  for (const clip of clips) {
+    clipByCell.set(`${clip.sceneIndex}:${clip.trackIndex}`, clip)
   }
 
-  return 0
+  const currentTrackByRole = new Map(currentTracks.map((track) => [track.role, track]))
+  const nextClips: ClipSlot[] = []
+
+  for (let sceneIndex = 0; sceneIndex < 8; sceneIndex += 1) {
+    for (let trackIndex = 0; trackIndex < nextTracks.length; trackIndex += 1) {
+      const targetCell = clipByCell.get(`${sceneIndex}:${trackIndex}`)
+      const targetBase =
+        targetCell ??
+        ({
+          ...emptyClip({
+            id: `clip-${sceneIndex + 1}-${trackIndex + 1}`,
+            trackIndex,
+            sceneIndex,
+            filled: false,
+            sampleId: null,
+            clipName: null,
+            category: null,
+            type: null,
+            bpm: null,
+            key: null,
+            parsedKey: null,
+            normalizedKey: null,
+            keySource: 'unknown',
+            keyConfidence: 'low',
+            excluded: false,
+            absolutePath: null,
+            relativePath: null,
+            detectedBpm: null,
+            bpmSource: 'unknown',
+            durationSeconds: null,
+            estimatedBeats: null,
+            beatsLength: null,
+            syncStatus: 'unsupported',
+            playbackRate: null,
+            color: null,
+            playing: false,
+            launchState: 'empty',
+            missingFile: false,
+          }),
+        } as ClipSlot)
+
+      const role = nextTracks[trackIndex]?.role
+      const previousTrack = role ? currentTrackByRole.get(role) : null
+      const source = previousTrack
+        ? clipByCell.get(`${sceneIndex}:${previousTrack.index}`) ?? null
+        : null
+
+      if (!source || !source.filled) {
+        nextClips.push(emptyClip(targetBase))
+        continue
+      }
+
+      nextClips.push({
+        ...source,
+        id: `clip-${sceneIndex + 1}-${trackIndex + 1}`,
+        sceneIndex,
+        trackIndex,
+        color: nextTracks[trackIndex]?.color ?? source.color,
+        playing: false,
+        launchState: 'stopped',
+      })
+    }
+  }
+
+  return nextClips
+}
+
+function moveArrayItem<T>(items: T[], fromIndex: number, toIndex: number) {
+  if (fromIndex === toIndex) {
+    return [...items]
+  }
+
+  const next = [...items]
+  const [item] = next.splice(fromIndex, 1)
+  next.splice(toIndex, 0, item)
+  return next
+}
+
+function applyTrackRoleOrderToState(
+  state: LaunchBrainState,
+  roleOrder: TrackRoleId[],
+  presetOverride?: LayoutPresetName,
+) {
+  const nextTracks = buildTracksFromRoleOrderWithState(state.tracks, roleOrder)
+  const nextClips = remapClipsForRoleOrder(state.clips, state.tracks, nextTracks)
+  const selectedClip = state.clips.find((clip) => clip.id === state.selectedClipId)
+  const selectedRole = selectedClip ? state.tracks[selectedClip.trackIndex]?.role ?? null : null
+  const selectedSceneIndex = selectedClip?.sceneIndex ?? 0
+  const selectedTrackIndex = selectedRole ? roleOrder.indexOf(selectedRole) : 0
+  const safeSelectedTrackIndex =
+    selectedTrackIndex >= 0 && selectedTrackIndex < nextTracks.length ? selectedTrackIndex : 0
+  const nextSelectedClipId = `clip-${selectedSceneIndex + 1}-${safeSelectedTrackIndex + 1}`
+
+  return {
+    tracks: nextTracks,
+    clips: nextClips,
+    selectedClipId: nextSelectedClipId,
+    layoutPresetName: presetOverride ?? inferLayoutPresetName(roleOrder),
+    missingFilesCount: nextClips.filter((clip) => clip.filled && clip.missingFile).length,
+  }
+}
+
+function getSampleEffectiveKey(sample: SampleRecord) {
+  return sample.normalizedKey ?? normalizeKey(sample.key)
+}
+
+function getProjectHarmonicKey(transport: TransportState) {
+  const explicit = normalizeKey(`${transport.key} ${transport.scale}`)
+  if (explicit) {
+    return explicit
+  }
+
+  return normalizeKey(transport.key)
+}
+
+function resolveActiveHarmonicTargetKey(
+  targetKeyFromOptions: string | null,
+  activeKeyFilter: string | null,
+  transport: TransportState,
+  sourceSamples: SampleRecord[],
+) {
+  if (targetKeyFromOptions) {
+    return normalizeKey(targetKeyFromOptions)
+  }
+
+  if (activeKeyFilter) {
+    const normalizedFilter = normalizeKey(activeKeyFilter)
+    if (normalizedFilter) {
+      return normalizedFilter
+    }
+  }
+
+  const projectKey = getProjectHarmonicKey(transport)
+  if (projectKey) {
+    return projectKey
+  }
+
+  return inferMostCommonKey(sourceSamples)
 }
 
 function inferMostCommonBpm(samples: SampleRecord[]) {
@@ -358,11 +545,12 @@ function inferMostCommonKey(samples: SampleRecord[]) {
   const counts = new Map<string, number>()
 
   for (const sample of samples) {
-    if (!sample.key) {
+    const sampleKey = getSampleEffectiveKey(sample)
+    if (!sampleKey) {
       continue
     }
 
-    counts.set(sample.key, (counts.get(sample.key) ?? 0) + 1)
+    counts.set(sampleKey, (counts.get(sampleKey) ?? 0) + 1)
   }
 
   let bestKey: string | null = null
@@ -390,6 +578,11 @@ function applySampleToClip(clip: ClipSlot, sample: SampleRecord, trackColor: str
     detectedBpm: sample.detectedBpm ?? sample.bpm,
     bpmSource: sample.bpmSource ?? (sample.bpm !== null ? 'filename' : 'unknown'),
     key: sample.key,
+    parsedKey: sample.parsedKey ?? sample.key,
+    normalizedKey: sample.normalizedKey ?? normalizeKey(sample.key),
+    keySource: sample.keySource ?? 'unknown',
+    keyConfidence: sample.keyConfidence ?? 'low',
+    excluded: sample.excluded ?? false,
     absolutePath: sample.absolutePath,
     relativePath: sample.relativePath,
     durationSeconds: sample.durationSeconds ?? null,
@@ -414,6 +607,11 @@ function emptyClip(clip: ClipSlot): ClipSlot {
     type: null,
     bpm: null,
     key: null,
+    parsedKey: null,
+    normalizedKey: null,
+    keySource: 'unknown',
+    keyConfidence: 'low',
+    excluded: false,
     absolutePath: null,
     relativePath: null,
     detectedBpm: null,
@@ -456,11 +654,15 @@ function isLoopLike(type: SampleType) {
   return type !== 'one-shot'
 }
 
-function getCategoryTargets(trackIndex: number): string[] {
-  return [TRACK_CATEGORY_MAP[trackIndex]]
+function getCategoryTargets(track: Track): string[] {
+  return track.acceptedCategories
 }
 
-function computePackCoverage(samples: SampleRecord[]) {
+function isKeyNeutralTrack(track: Track) {
+  return track.keyNeutral || track.role === 'drum' || track.role === 'drum2_hats' || track.role === 'fx'
+}
+
+function computePackCoverage(samples: SampleRecord[], tracks: Track[]) {
   const coverageByPack = new Map<string, Set<string>>()
 
   for (const sample of samples) {
@@ -474,14 +676,10 @@ function computePackCoverage(samples: SampleRecord[]) {
       continue
     }
 
-    for (const target of TRACK_CATEGORY_MAP) {
-      if (sample.category === target) {
-        set.add(target)
+    for (const track of tracks) {
+      if (track.acceptedCategories.includes(sample.category)) {
+        set.add(track.role)
       }
-    }
-
-    if (sample.category === 'Drums') {
-      set.add('Hats / Perc')
     }
   }
 
@@ -501,21 +699,28 @@ function computePackCoverage(samples: SampleRecord[]) {
 
 function scoreSampleCandidate(
   sample: SampleRecord,
-  trackIndex: number,
+  track: Track,
   preferredPack: string | null,
   targetBpm: number | null,
   targetKey: string | null,
   settings: AutoFillSettings,
 ) {
+  if (sample.excluded) {
+    return Number.NEGATIVE_INFINITY
+  }
+
   let score = 0
-  const categoryTargets = getCategoryTargets(trackIndex)
+  const categoryTargets = getCategoryTargets(track)
   const samplePack = getSamplePack(sample)
-  const isFxTrack = trackIndex === 7
+  const isFxTrack = track.role === 'fx'
+  const allowKeyNeutralStrict = settings.allowKeyNeutralStrict && isKeyNeutralTrack(track)
 
   if (categoryTargets.includes(sample.category)) {
-    score += 36
+    score += 42
   } else if (sample.category === 'Uncategorized') {
-    score += 4
+    score += 2
+  } else {
+    score -= 22
   }
 
   if (preferredPack && samplePack === preferredPack) {
@@ -538,20 +743,34 @@ function scoreSampleCandidate(
       score -= 18
     }
   } else if (bpmValue === null) {
-    score -= 10
+    score -= 14
   }
 
-  const keyCompatibility = getKeyCompatibility(sample.key, targetKey)
+  const sampleKey = getSampleEffectiveKey(sample)
 
-  if (targetKey && sample.key) {
-    if (keyCompatibility >= 1) {
-      score += 14
-    } else if (keyCompatibility >= 0.55) {
-      score += 8
+  if (targetKey && settings.keyStrictness !== 'off') {
+    if (!sampleKey) {
+      if (!allowKeyNeutralStrict && !settings.allowUnknownKeySamples) {
+        return Number.NEGATIVE_INFINITY
+      }
+      score += allowKeyNeutralStrict ? 6 : -14
     } else if (settings.keyStrictness === 'strict') {
-      score -= 40
-    } else if (settings.keyStrictness === 'compatible') {
-      score -= 8
+      if (allowKeyNeutralStrict) {
+        score += 6
+      } else if (!areKeysExactMatch(sampleKey, targetKey)) {
+        return Number.NEGATIVE_INFINITY
+      }
+      if (!allowKeyNeutralStrict) {
+        score += 26
+      }
+    } else if (areKeysExactMatch(sampleKey, targetKey)) {
+      score += 22
+    } else if (areKeysCompatible(sampleKey, targetKey, 'compatible')) {
+      score += 11
+    } else if (allowKeyNeutralStrict) {
+      score += 4
+    } else {
+      return Number.NEGATIVE_INFINITY
     }
   }
 
@@ -563,7 +782,7 @@ function scoreSampleCandidate(
     }
   }
 
-  if (settings.allowOneShotsInFXOnly && !isFxTrack && sample.type === 'one-shot') {
+  if ((settings.allowOneShotsInFXOnly || !track.allowOneShots) && !isFxTrack && sample.type === 'one-shot') {
     score -= 35
   }
 
@@ -572,21 +791,18 @@ function scoreSampleCandidate(
   return score
 }
 
-function getCoverageLabel(samples: SampleRecord[]) {
+function getCoverageLabel(samples: SampleRecord[], tracks: Track[]) {
   const categories = new Set(samples.map((sample) => sample.category))
-  const nonRhythmCategories = ['Bass', 'Instrument / Chord', 'Melody', 'Guitar / Texture', 'Vocal']
-  const nonRhythmHits = nonRhythmCategories.filter((category) => categories.has(category)).length
+  const matchedRoles = tracks.filter((track) =>
+    track.acceptedCategories.some((category) => categories.has(category)),
+  ).length
 
-  const hasDrums = categories.has('Drums')
-  const hasPerc = categories.has('Hats / Perc')
-
-  if ((hasDrums || hasPerc) && nonRhythmHits === 0) {
-    return 'Drums only'
+  if (matchedRoles >= Math.max(6, tracks.length - 1)) {
+    return 'Full pack'
   }
 
-  const trackCoverage = TRACK_CATEGORY_MAP.filter((category) => categories.has(category)).length
-  if (trackCoverage >= 6) {
-    return 'Full pack'
+  if (matchedRoles <= 2) {
+    return 'Narrow pack'
   }
 
   return 'Partial pack'
@@ -613,6 +829,8 @@ function buildSessionManifestFromState(
     key: state.transport.key,
     scale: state.transport.scale,
     autoFillSettings: state.autoFillSettings,
+    layoutPresetName: state.layoutPresetName,
+    tracks: state.tracks,
     clips: state.clips.map((clip) => ({
       id: clip.id,
       clipName: clip.clipName,
@@ -628,6 +846,11 @@ function buildSessionManifestFromState(
       type: clip.type,
       bpm: clip.bpm,
       key: clip.key,
+      parsedKey: clip.parsedKey,
+      normalizedKey: clip.normalizedKey,
+      keySource: clip.keySource,
+      keyConfidence: clip.keyConfidence,
+      excluded: clip.excluded,
       detectedBpm: clip.detectedBpm,
       bpmSource: clip.bpmSource,
       durationSeconds: clip.durationSeconds,
@@ -673,6 +896,11 @@ function applyLoadedSessionToClipGrid(
       type: saved.type ?? null,
       bpm: saved.bpm ?? null,
       key: saved.key ?? null,
+      parsedKey: saved.parsedKey ?? saved.key ?? null,
+      normalizedKey: saved.normalizedKey ?? normalizeKey(saved.key ?? null),
+      keySource: saved.keySource ?? 'unknown',
+      keyConfidence: saved.keyConfidence ?? 'low',
+      excluded: saved.excluded ?? false,
       detectedBpm: saved.detectedBpm ?? saved.bpm ?? null,
       bpmSource: saved.bpmSource ?? (saved.bpm !== null ? 'filename' : 'unknown'),
       durationSeconds: saved.durationSeconds ?? null,
@@ -766,7 +994,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       set({
         previewingSampleId: sample.id,
         previewingFilename: sample.filename,
-        playbackEngineStatus: 'Playback engine: browser prototype',
+        playbackEngineStatus: 'Browser playback engine',
         lastAction: `Previewing sample: ${sample.filename}`,
       })
     } catch (error) {
@@ -790,15 +1018,27 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           clockBeatInCycle: event.snapshot.beatInCycle,
           clockBeatsPerBar: event.snapshot.beatsPerBar,
           clockQuantizeBeats: event.snapshot.quantizeBeats,
+          transportDiagnostics: audioTransport.getDiagnostics(),
         })
         return
       }
 
       if (event.type === 'clip-error') {
-        set({
+        set((state) => ({
+          clips: state.clips.map((clip) =>
+            clip.id === event.clipId
+              ? {
+                  ...clip,
+                  playing: false,
+                  launchState: clip.filled ? 'stopped' : 'empty',
+                  syncStatus: 'unsupported',
+                }
+              : clip,
+          ),
           errorMessage: event.message,
-          lastAction: `Failed to load sample: ${event.message}`,
-        })
+          lastAction: `Clip unavailable: ${event.filename ?? event.clipId}`,
+          transportDiagnostics: audioTransport.getDiagnostics(),
+        }))
         return
       }
 
@@ -831,7 +1071,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
             }
           }),
           queuedSceneLabel: null,
-          playbackEngineStatus: 'Playback engine: browser prototype',
+          playbackEngineStatus: 'Browser playback engine',
+          transportDiagnostics: audioTransport.getDiagnostics(),
           lastAction: state.queuedSceneLabel
             ? `Scene launched: ${state.queuedSceneLabel}`
             : `Clip started: ${event.filename ?? event.clipId}`,
@@ -850,6 +1091,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
                 }
               : clip,
           ),
+          transportDiagnostics: audioTransport.getDiagnostics(),
           lastAction: event.filename ? `Clip stopped: ${event.filename}` : state.lastAction,
         }))
       }
@@ -865,6 +1107,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       clockBeatInCycle: 1,
       clockBeatsPerBar: beatsPerBar,
       clockQuantizeBeats: Math.max(1, getQuantizeBeats(get().transport.quantize, beatsPerBar) || beatsPerBar),
+      transportDiagnostics: audioTransport.getDiagnostics(),
     })
   }
 
@@ -903,6 +1146,168 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     }
   }
 
+  const buildTransportRequestFromSample = (
+    clip: Pick<ClipSlot, 'id' | 'trackIndex'>,
+    sample: SampleRecord,
+  ): TransportClipRequest => {
+    const state = get()
+    const samplePack = getSamplePack(sample)
+    const packSamples = state.samples.filter((item) => getSamplePack(item) === samplePack)
+    const packBpm = inferMostCommonBpm(packSamples)
+    const effectiveBpm = getSampleEffectiveBpm(sample, packBpm)
+
+    return {
+      clipId: clip.id,
+      trackIndex: clip.trackIndex,
+      sampleId: sample.id,
+      filename: sample.filename,
+      type: sample.type ?? 'unknown',
+      bpm: sample.bpm ?? effectiveBpm.bpm,
+      detectedBpm: sample.detectedBpm ?? effectiveBpm.bpm,
+      bpmSource:
+        sample.detectedBpm !== null || sample.bpm !== null
+          ? sample.bpmSource ?? 'filename'
+          : effectiveBpm.source,
+      beatsLength: sample.beatsLength,
+      estimatedBeats: sample.estimatedBeats,
+    }
+  }
+
+  const prepareSampleForGridClip = async (
+    clip: Pick<ClipSlot, 'id' | 'trackIndex'>,
+    sample: SampleRecord,
+  ) => {
+    const request = buildTransportRequestFromSample(clip, sample)
+    const sync = await audioTransport.prepareClipForPlayback(request)
+
+    return {
+      bpm: request.bpm,
+      detectedBpm: sync.detectedBpm ?? request.detectedBpm,
+      bpmSource: sync.detectedBpm !== null ? sync.bpmSource : request.bpmSource,
+      durationSeconds: sync.durationSeconds,
+      estimatedBeats: sync.estimatedBeats,
+      beatsLength: sync.beatsLength,
+      syncStatus: sync.syncStatus,
+      playbackRate: sync.playbackRate,
+    } as Partial<SampleRecord>
+  }
+
+  const releaseClipFromTransport = (clip: ClipSlot) => {
+    audioTransport.cancelQueuedClipStart(clip.id)
+    audioTransport.stopClipImmediately(clip.id)
+
+    if (clip.playing || clip.launchState === 'stopping') {
+      console.debug('LaunchBrain clip transport state cleared for replacement', {
+        clipId: clip.id,
+        diagnostics: audioTransport.getDiagnostics(),
+      })
+    }
+  }
+
+  const assignPreparedSampleToClipInternal = async (clipId: string, sampleId: string) => {
+    const state = get()
+    const selectedSample = state.samples.find((sample) => sample.id === sampleId)
+    const selectedClip = state.clips.find((clip) => clip.id === clipId)
+    if (!selectedSample || !selectedClip) {
+      set({ lastAction: 'Assign skipped: invalid sample or clip' })
+      return
+    }
+
+    const track = state.tracks.find((item) => item.index === selectedClip.trackIndex)
+    const trackColor = track?.color ?? '#64748b'
+    releaseClipFromTransport(selectedClip)
+
+    const optimisticClip = applySampleToClip(selectedClip, selectedSample, trackColor)
+    set((current) => {
+      const nextClips: ClipSlot[] = current.clips.map((clip) =>
+        clip.id === selectedClip.id
+          ? {
+              ...optimisticClip,
+              playing: false,
+              launchState: 'stopped',
+            }
+          : clip,
+      )
+
+      return {
+        clips: nextClips,
+        selectedClipId: selectedClip.id,
+        selectedSampleId: selectedSample.id,
+        missingFilesCount: nextClips.filter((clip) => clip.filled && clip.missingFile).length,
+        saveStatus: 'dirty',
+        errorMessage: null,
+        lastAction: `Preparing ${selectedSample.filename} for clip ${selectedClip.sceneIndex + 1}.${selectedClip.trackIndex + 1}`,
+      }
+    })
+
+    try {
+      const preparedPatch = await prepareSampleForGridClip(selectedClip, selectedSample)
+
+      set((current) => {
+        const currentSample = current.samples.find((sample) => sample.id === selectedSample.id) ?? selectedSample
+        const currentClip = current.clips.find((clip) => clip.id === selectedClip.id)
+        if (!currentClip || currentClip.sampleId !== selectedSample.id) {
+          return current
+        }
+
+        const preparedSample = {
+          ...currentSample,
+          ...preparedPatch,
+        }
+        const nextSamples = current.samples.map((sample) =>
+          sample.id === selectedSample.id ? preparedSample : sample,
+        )
+        const nextClips = current.clips.map((clip) =>
+          clip.id === selectedClip.id ? applySampleToClip(clip, preparedSample, trackColor) : clip,
+        )
+
+        return {
+          samples: nextSamples,
+          clips: nextClips,
+          missingFilesCount: nextClips.filter((clip) => clip.filled && clip.missingFile).length,
+          saveStatus: 'dirty',
+          lastAction: `Loaded ${selectedSample.filename} to clip ${selectedClip.sceneIndex + 1}.${selectedClip.trackIndex + 1}`,
+        }
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to prepare sample for transport'
+      console.debug('LaunchBrain clip preparation failed', {
+        clipId: selectedClip.id,
+        sampleId: selectedSample.id,
+        diagnostics: audioTransport.getDiagnostics(),
+        message,
+      })
+
+      set((current) => {
+        const currentClip = current.clips.find((clip) => clip.id === selectedClip.id)
+        if (!currentClip || currentClip.sampleId !== selectedSample.id) {
+          return current
+        }
+
+        const nextClips: ClipSlot[] = current.clips.map((clip) =>
+          clip.id === selectedClip.id
+            ? {
+                ...clip,
+                syncStatus: 'unsupported',
+                durationSeconds: clip.durationSeconds ?? null,
+                estimatedBeats: clip.estimatedBeats ?? null,
+                beatsLength: clip.beatsLength ?? null,
+                playbackRate: clip.playbackRate ?? null,
+                playing: false,
+                launchState: 'stopped',
+              }
+            : clip,
+        )
+
+        return {
+          clips: nextClips,
+          errorMessage: message,
+          lastAction: `Sample prepared with limited sync: ${selectedSample.filename}`,
+        }
+      })
+    }
+  }
+
   const ensureTransportForQueuedLaunch = async () => {
     ensureAudioTransportSubscription()
     configureAudioTransport()
@@ -915,7 +1320,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           ...current.transport,
           isPlaying: true,
         },
-        playbackEngineStatus: 'Playback engine: browser prototype',
+        playbackEngineStatus: 'Browser playback engine',
         lastAction: 'Transport running',
       }))
     }
@@ -942,7 +1347,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         audioTransport.getNextBoundaryTime('None'),
       )
     }
-    set({ lastAction: `Clip stopped: ${TRACK_LABELS[trackIndex] ?? `Track ${trackIndex + 1}`}` })
+    set({ lastAction: `Clip stopped: ${getTrackLabel(state.tracks, trackIndex)}` })
   }
 
   const stopAllClipsNow = () => {
@@ -959,8 +1364,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
   }
 
   const queueTrackSwitch = (trackIndex: number, startClipId: string, boundaryOverride?: number) => {
-    const trackLabel = TRACK_LABELS[trackIndex] ?? `Track ${trackIndex + 1}`
     const state = get()
+    const trackLabel = getTrackLabel(state.tracks, trackIndex)
     const hasOtherPlaying = state.clips.some(
       (clip) => clip.trackIndex === trackIndex && clip.playing && clip.id !== startClipId,
     )
@@ -1058,6 +1463,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
   const resolveAutoFillSource = (
     samples: SampleRecord[],
+    tracks: Track[],
     activePack: string | null,
     sourceScope: AutoFillSettings['sourceScope'],
   ) => {
@@ -1066,6 +1472,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         sourceSamples: samples,
         chosenPack: null as string | null,
         sourceLabel: 'Entire library',
+        sourceReason: 'Using the full library as the current source.',
       }
     }
 
@@ -1077,16 +1484,18 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
             sourceSamples: scoped,
             chosenPack: activePack,
             sourceLabel: `Selected Bank: ${activePack}`,
+            sourceReason: 'Using the selected pack as the current source context.',
           }
         }
       }
 
-      const bestPack = computePackCoverage(samples)
+      const bestPack = computePackCoverage(samples, tracks)
       if (bestPack) {
         return {
           sourceSamples: samples.filter((sample) => getSamplePack(sample) === bestPack),
           chosenPack: bestPack,
           sourceLabel: `Auto-selected pack: ${bestPack}`,
+          sourceReason: 'Auto-selected because it has the best category coverage and BPM/key compatibility.',
         }
       }
 
@@ -1094,15 +1503,17 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         sourceSamples: samples,
         chosenPack: null,
         sourceLabel: 'Entire library (fallback)',
+        sourceReason: 'Falling back to the full library because no selected pack was available.',
       }
     }
 
-    const bestPack = computePackCoverage(samples)
+    const bestPack = computePackCoverage(samples, tracks)
     if (bestPack) {
       return {
         sourceSamples: samples.filter((sample) => getSamplePack(sample) === bestPack),
         chosenPack: bestPack,
         sourceLabel: `Auto-selected pack: ${bestPack}`,
+        sourceReason: 'Auto-selected because it has the best category coverage and BPM/key compatibility.',
       }
     }
 
@@ -1110,6 +1521,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       sourceSamples: samples,
       chosenPack: null,
       sourceLabel: 'Entire library (fallback)',
+      sourceReason: 'Falling back to the full library because no strong source pack was found.',
     }
   }
 
@@ -1118,6 +1530,45 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       clips: state.clips.map((clip) => ({ ...clip })),
       missingFilesCount: state.missingFilesCount,
       message,
+    }
+  }
+
+  const normalizeOverridePath = (relativePath: string) => relativePath.replace(/\\+/g, '/')
+
+  const applySamplePatchAcrossState = (
+    state: LaunchBrainState,
+    sampleId: string,
+    patch: Partial<SampleRecord>,
+  ) => {
+    const nextSamples = state.samples.map((sample) => (sample.id === sampleId ? { ...sample, ...patch } : sample))
+
+    const nextClips = state.clips.map((clip) => {
+      if (clip.sampleId !== sampleId) {
+        return clip
+      }
+
+      return {
+        ...clip,
+        bpm: patch.bpm ?? clip.bpm,
+        detectedBpm: patch.detectedBpm ?? clip.detectedBpm,
+        bpmSource: patch.bpmSource ?? clip.bpmSource,
+        key: patch.key ?? clip.key,
+        parsedKey: patch.parsedKey ?? clip.parsedKey,
+        normalizedKey: patch.normalizedKey ?? clip.normalizedKey,
+        keySource: patch.keySource ?? clip.keySource,
+        keyConfidence: patch.keyConfidence ?? clip.keyConfidence,
+        excluded: patch.excluded ?? clip.excluded,
+        durationSeconds: patch.durationSeconds ?? clip.durationSeconds,
+        estimatedBeats: patch.estimatedBeats ?? clip.estimatedBeats,
+        beatsLength: patch.beatsLength ?? clip.beatsLength,
+        syncStatus: patch.syncStatus ?? clip.syncStatus,
+        playbackRate: patch.playbackRate ?? clip.playbackRate,
+      }
+    })
+
+    return {
+      samples: nextSamples,
+      clips: nextClips,
     }
   }
 
@@ -1152,7 +1603,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     categories: [],
     importedFolders: [],
     samples: [],
-    tracks: createDefaultTracks(),
+    tracks: createDefaultTracks(DEFAULT_LAYOUT_PRESET),
     scenes: createDefaultScenes(),
     clips: createEmptyClips(),
     selectedSampleId: null,
@@ -1167,7 +1618,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     isScanning: false,
     previewingSampleId: null,
     previewingFilename: null,
-    playbackEngineStatus: 'Playback engine: browser prototype',
+    playbackEngineStatus: 'Browser playback engine',
     lastAction: 'Ready',
     errorMessage: null,
     activePack: null,
@@ -1193,7 +1644,10 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     folderBrowserAudioFileCountRecursiveEstimate: null,
     autoFillSettings: { ...DEFAULT_AUTO_FILL_SETTINGS },
     autoFillOptionsOpen: false,
-    autoFillResolvedSource: 'Auto-selected pack: pending',
+    layoutPresetName: DEFAULT_LAYOUT_PRESET,
+    autoFillResolvedSource: 'Auto best pack',
+    autoFillResolvedSourceReason: 'Auto-selects the pack with the best category coverage and BPM/key compatibility.',
+    autoFillResolvedKey: null,
     clockProgress: 0,
     clockBeatInBar: 1,
     clockBeatInCycle: 1,
@@ -1208,6 +1662,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     lastClearSnapshot: null,
     recentSessions: [],
     selectedRecentSessionId: null,
+    sampleOverrides: {},
+    transportDiagnostics: audioTransport.getDiagnostics(),
     autoFillCoverageLabel: 'Partial pack',
     canUndoClear: false,
 
@@ -1216,11 +1672,12 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       ensureAudioTransportSubscription()
 
       try {
-        const [config, devices, sampleIndex, sessionList] = await Promise.all([
+        const [config, devices, sampleIndex, sessionList, overrideResponse] = await Promise.all([
           getConfig(),
           getDevices(),
           getSampleIndex(),
           apiListSessions().catch(() => ({ sessions: [] })),
+          apiGetSampleOverrides().catch(() => ({ overrides: {} })),
         ])
 
         set({
@@ -1230,11 +1687,12 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           ...(sampleIndex ? applyScanSnapshotToState(sampleIndex) : {}),
           recentSessions: sessionList.sessions,
           selectedRecentSessionId: sessionList.sessions[0]?.id ?? null,
+          sampleOverrides: overrideResponse.overrides ?? {},
           isBootstrapping: false,
           lastAction: sampleIndex
             ? `Library scanned (cached): ${sampleIndex.sampleCount} samples`
             : 'Loaded config and device status',
-          playbackEngineStatus: 'Playback engine: browser prototype',
+          playbackEngineStatus: 'Browser playback engine',
         })
         configureAudioTransport()
       } catch (error) {
@@ -1302,7 +1760,15 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         audioTransport.stopAll()
 
         const state = get()
-        const applied = applyLoadedSessionToClipGrid(state.clips, loaded, state.tracks)
+        const loadedRoleOrder = normalizeRoleOrderFromLoadedTracks((loaded.tracks as Partial<Track>[] | undefined) ?? [])
+        const restoredTracks = buildTracksFromRoleOrderWithState(
+          Array.isArray(loaded.tracks) && loaded.tracks.length > 0 ? (loaded.tracks as Track[]) : state.tracks,
+          loadedRoleOrder,
+        )
+        const applied = applyLoadedSessionToClipGrid(state.clips, loaded, restoredTracks)
+        const restoredPresetName =
+          loaded.layoutPresetName ??
+          inferLayoutPresetName(loadedRoleOrder)
 
         set((current) => ({
           transport: {
@@ -1319,10 +1785,20 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
             sampleRoot: loaded.sampleRoot ?? current.config.sampleRoot,
           },
           activePack: loaded.selectedPack ?? null,
-          autoFillSettings: loaded.autoFillSettings ?? current.autoFillSettings,
+          autoFillSettings: {
+            ...DEFAULT_AUTO_FILL_SETTINGS,
+            ...current.autoFillSettings,
+            ...(loaded.autoFillSettings ?? {}),
+          },
+          tracks: restoredTracks,
+          layoutPresetName: restoredPresetName,
           autoFillResolvedSource: loaded.selectedPack
             ? `Selected pack: ${loaded.selectedPack}`
             : current.autoFillResolvedSource,
+          autoFillResolvedSourceReason: loaded.selectedPack
+            ? 'Using the selected pack from the loaded session.'
+            : current.autoFillResolvedSourceReason,
+          autoFillResolvedKey: normalizeKey(loaded.autoFillSettings?.targetKey ?? null),
           clips: applied.nextClips,
           currentSessionId: loaded.id,
           currentSessionName: loaded.name,
@@ -1500,7 +1976,10 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       set({ isScanning: true, errorMessage: null })
 
       try {
-        const result = await scanSamples()
+        const [result, overrideResponse] = await Promise.all([
+          scanSamples(),
+          apiGetSampleOverrides().catch(() => ({ overrides: {} })),
+        ])
         set((state) => ({
           config: {
             ...state.config,
@@ -1508,6 +1987,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
             lastScanAt: result.scannedAt,
           },
           ...applyScanSnapshotToState(result),
+          sampleOverrides: overrideResponse.overrides ?? state.sampleOverrides,
           clips: state.clips.map((clip) => (clip.filled ? { ...clip, launchState: 'stopped' } : clip)),
           isScanning: false,
           lastAction: `Library scanned: ${result.sampleCount} samples`,
@@ -1538,7 +2018,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
       set((current) => ({
         transport: { ...current.transport, isPlaying: true },
-        playbackEngineStatus: 'Playback engine: browser prototype',
+        playbackEngineStatus: 'Browser playback engine',
+        transportDiagnostics: audioTransport.getDiagnostics(),
         lastAction: 'Transport running',
       }))
     },
@@ -1558,6 +2039,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           launchState: clip.filled ? 'stopped' : 'empty',
         })),
         queuedSceneLabel: null,
+        transportDiagnostics: audioTransport.getDiagnostics(),
         lastAction: 'Transport stopped: all clips',
       }))
     },
@@ -1612,7 +2094,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
     toggleRecord: () =>
       set({
-        lastAction: 'Record is disabled in this prototype',
+        lastAction: 'Record / capture is coming soon for live input tracks',
       }),
 
     setTempo: (tempo) => {
@@ -1672,6 +2154,10 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           ...state.autoFillSettings,
           sourceScope: pack ? 'selectedPack' : state.autoFillSettings.sourceScope,
         },
+        autoFillResolvedSource: pack ? `Selected Bank: ${pack}` : state.autoFillResolvedSource,
+        autoFillResolvedSourceReason: pack
+          ? 'Using the selected pack as the current source context.'
+          : state.autoFillResolvedSourceReason,
         saveStatus: 'dirty',
         lastAction: pack ? `Selected pack: ${pack}` : 'Pack filter cleared',
       })),
@@ -1690,7 +2176,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
     setActiveKeyFilter: (key) =>
       set({
-        activeKeyFilter: key,
+        activeKeyFilter: key ? normalizeKey(key) ?? key : null,
         lastAction: key ? `Key filter: ${key}` : 'Key filter cleared',
       }),
 
@@ -1737,6 +2223,206 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       void startPreviewInternal(sampleId)
     },
 
+    analyzeKeyForSample: async (sampleId) => {
+      const sample = get().samples.find((item) => item.id === sampleId)
+      if (!sample) {
+        set({ lastAction: 'Analyze key skipped: sample not found' })
+        return
+      }
+
+      try {
+        const response = await apiAnalyzeSampleKey(sampleId)
+        if (!response.available) {
+          set({
+            lastAction: response.message,
+          })
+          return
+        }
+
+        set({
+          lastAction: `Key analysis result: ${response.normalizedKey ?? 'Unknown'}`,
+        })
+      } catch (error) {
+        set({
+          errorMessage: error instanceof Error ? error.message : 'Analyze key failed',
+          lastAction: 'Analyze key failed',
+        })
+      }
+    },
+
+    setSampleManualKey: async (sampleId, manualKey) => {
+      const state = get()
+      const sample = state.samples.find((item) => item.id === sampleId)
+      if (!sample) {
+        set({ lastAction: 'Set key skipped: sample not found' })
+        return
+      }
+
+      const isKnownMusicalKey =
+        manualKey === null ||
+        manualKey === 'UNKNOWN' ||
+        ALL_MUSICAL_KEYS.includes(manualKey as (typeof ALL_MUSICAL_KEYS)[number])
+
+      if (!isKnownMusicalKey) {
+        set({ lastAction: 'Invalid key value for manual override' })
+        return
+      }
+
+      const overrideKey = normalizeOverridePath(sample.relativePath)
+      const existingOverride = state.sampleOverrides[overrideKey] ?? {
+        manualKey: null,
+        manualBpm: null,
+        excluded: sample.excluded,
+        notes: '',
+      }
+
+      const normalizedManualKey =
+        manualKey && manualKey !== 'UNKNOWN' ? normalizeKey(manualKey) : null
+      const parsedManualKey = normalizedManualKey ? parseKey(normalizedManualKey) : null
+
+      try {
+        const result = await apiUpsertSampleOverride({
+          relativePath: sample.relativePath,
+          manualKey: manualKey,
+          manualBpm: existingOverride.manualBpm,
+          excluded: existingOverride.excluded,
+          notes: existingOverride.notes,
+        })
+
+        set((current) => {
+          const nextOverrides = { ...current.sampleOverrides }
+          if (result.override) {
+            nextOverrides[overrideKey] = result.override
+          } else {
+            delete nextOverrides[overrideKey]
+          }
+
+          const patch: Partial<SampleRecord> = parsedManualKey
+            ? {
+                key: parsedManualKey.normalizedKey,
+                parsedKey: parsedManualKey.normalizedKey,
+                normalizedKey: parsedManualKey.normalizedKey,
+                keySource: 'manual',
+                keyConfidence: 'high',
+              }
+            : {
+                key: null,
+                parsedKey: null,
+                normalizedKey: null,
+                keySource: 'manual',
+                keyConfidence: 'high',
+              }
+
+          const next = applySamplePatchAcrossState(current, sampleId, patch)
+
+          return {
+            ...next,
+            sampleOverrides: nextOverrides,
+            saveStatus: 'dirty',
+            lastAction: parsedManualKey
+              ? `Manual key set: ${sample.filename} -> ${parsedManualKey.normalizedKey}`
+              : `Manual key set: ${sample.filename} -> Unknown`,
+          }
+        })
+      } catch (error) {
+        set({
+          errorMessage: error instanceof Error ? error.message : 'Set manual key failed',
+          lastAction: 'Set manual key failed',
+        })
+      }
+    },
+
+    markSampleKeyUnknown: async (sampleId) => {
+      await get().setSampleManualKey(sampleId, 'UNKNOWN')
+    },
+
+    setSampleAsProjectKey: (sampleId) => {
+      const sample = get().samples.find((item) => item.id === sampleId)
+      if (!sample) {
+        return
+      }
+
+      const parsed = parseKey(sample.normalizedKey ?? sample.key)
+      if (!parsed) {
+        set({ lastAction: 'Cannot use unknown key as project key' })
+        return
+      }
+
+      set((state) => ({
+        transport: {
+          ...state.transport,
+          key: parsed.canonicalTonic,
+          scale: parsed.mode,
+        },
+        saveStatus: 'dirty',
+        lastAction: `Project key set from sample: ${parsed.normalizedKey}`,
+      }))
+    },
+
+    toggleSampleExcludedInAutoFill: async (sampleId, excluded) => {
+      const state = get()
+      const sample = state.samples.find((item) => item.id === sampleId)
+      if (!sample) {
+        return
+      }
+
+      const overrideKey = normalizeOverridePath(sample.relativePath)
+      const existingOverride = state.sampleOverrides[overrideKey] ?? {
+        manualKey: sample.keySource === 'manual' ? sample.normalizedKey : null,
+        manualBpm: sample.bpmSource === 'manual' ? sample.bpm : null,
+        excluded: sample.excluded,
+        notes: '',
+      }
+
+      try {
+        const result = await apiUpsertSampleOverride({
+          relativePath: sample.relativePath,
+          manualKey: existingOverride.manualKey,
+          manualBpm: existingOverride.manualBpm,
+          excluded,
+          notes: existingOverride.notes,
+        })
+
+        set((current) => {
+          const nextOverrides = { ...current.sampleOverrides }
+          if (result.override) {
+            nextOverrides[overrideKey] = result.override
+          } else {
+            delete nextOverrides[overrideKey]
+          }
+
+          const next = applySamplePatchAcrossState(current, sampleId, { excluded })
+
+          return {
+            ...next,
+            sampleOverrides: nextOverrides,
+            saveStatus: 'dirty',
+            lastAction: excluded
+              ? `Excluded from Auto Fill: ${sample.filename}`
+              : `Included in Auto Fill: ${sample.filename}`,
+          }
+        })
+      } catch (error) {
+        set({
+          errorMessage: error instanceof Error ? error.message : 'Update exclusion failed',
+          lastAction: 'Update exclusion failed',
+        })
+      }
+    },
+
+    showSampleMetadata: (sampleId) => {
+      const sample = get().samples.find((item) => item.id === sampleId)
+      if (!sample) {
+        return
+      }
+
+      const keyLabel = sample.normalizedKey ?? 'Unknown'
+      const bpmLabel = sample.bpm ?? '--'
+      set({
+        lastAction: `Metadata: ${sample.filename} | ${bpmLabel} BPM | ${keyLabel} | ${sample.type}`,
+      })
+    },
+
     toggleSelectedSamplePreview: async () => {
       const { selectedSampleId, previewingSampleId } = get()
       if (!selectedSampleId) {
@@ -1766,68 +2452,47 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       })
     },
 
-    assignSampleToClip: (clipId, sampleId) =>
-      set((state) => {
-        const selectedSample = state.samples.find((sample) => sample.id === sampleId)
-        const selectedClip = state.clips.find((clip) => clip.id === clipId)
-        if (!selectedSample || !selectedClip) {
-          return { lastAction: 'Assign skipped: invalid sample or clip' }
-        }
+    assignSampleToClip: async (clipId, sampleId) => {
+      await assignPreparedSampleToClipInternal(clipId, sampleId)
+    },
 
-        const track = state.tracks.find((item) => item.index === selectedClip.trackIndex)
-        const nextClips = state.clips.map((clip) =>
-          clip.id === selectedClip.id
-            ? applySampleToClip(clip, selectedSample, track?.color ?? '#64748b')
-            : clip,
-        )
+    loadSelectedFileToSelectedClip: async () => {
+      const state = get()
+      const selectedSampleId = state.selectedSampleId
+      const selectedClipId = state.selectedClipId
 
-        return {
-          clips: nextClips,
-          selectedClipId: selectedClip.id,
-          selectedSampleId: selectedSample.id,
-          missingFilesCount: nextClips.filter((clip) => clip.filled && clip.missingFile).length,
-          saveStatus: 'dirty',
-          lastAction: `Loaded ${selectedSample.filename} to clip ${selectedClip.sceneIndex + 1}.${selectedClip.trackIndex + 1}`,
-        }
-      }),
+      if (!selectedSampleId || !selectedClipId) {
+        set({ lastAction: 'Load skipped: select both a clip and a sample' })
+        return
+      }
 
-    loadSelectedFileToSelectedClip: () =>
-      set((state) => {
-        const selectedSample = state.samples.find((sample) => sample.id === state.selectedSampleId)
-        const selectedClip = state.clips.find((clip) => clip.id === state.selectedClipId)
+      await assignPreparedSampleToClipInternal(selectedClipId, selectedSampleId)
+    },
 
-        if (!selectedSample || !selectedClip) {
-          return { lastAction: 'Load skipped: select both a clip and a sample' }
-        }
-
-        const track = state.tracks.find((item) => item.index === selectedClip.trackIndex)
-        const nextClips = state.clips.map((clip) =>
-          clip.id === selectedClip.id
-            ? applySampleToClip(clip, selectedSample, track?.color ?? '#64748b')
-            : clip,
-        )
-        const missingFilesCount = nextClips.filter((clip) => clip.filled && clip.missingFile).length
-
-        return {
-          clips: nextClips,
-          missingFilesCount,
-          saveStatus: 'dirty',
-          lastAction: `Loaded ${selectedSample.filename} to clip ${selectedClip.sceneIndex + 1}.${selectedClip.trackIndex + 1}`,
-        }
-      }),
-
-    loadSampleToSelectedClip: (sampleId) => {
+    loadSampleToSelectedClip: async (sampleId) => {
       set({ selectedSampleId: sampleId })
-      get().loadSelectedFileToSelectedClip()
+      await get().loadSelectedFileToSelectedClip()
     },
 
     setAutoFillSettings: (partial) =>
       set((state) => ({
-        autoFillSettings: {
-          ...state.autoFillSettings,
-          ...partial,
-          bpmTolerance: Math.max(0, Number(partial.bpmTolerance ?? state.autoFillSettings.bpmTolerance)),
-        },
+        autoFillSettings: (() => {
+          const merged = {
+            ...state.autoFillSettings,
+            ...partial,
+            bpmTolerance: Math.max(0, Number(partial.bpmTolerance ?? state.autoFillSettings.bpmTolerance)),
+          }
+
+          if (partial.keyStrictness === 'strict' && partial.allowUnknownKeySamples === undefined) {
+            merged.allowUnknownKeySamples = false
+          }
+
+          if (partial.keyStrictness === 'compatible' && partial.allowUnknownKeySamples === undefined) {
+            merged.allowUnknownKeySamples = true
+          }
+
+          return merged
+        })(),
         saveStatus: 'dirty',
       })),
 
@@ -1835,6 +2500,64 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       set((state) => ({
         autoFillOptionsOpen: !state.autoFillOptionsOpen,
       })),
+
+    applyLayoutPreset: (presetName) => {
+      const roleOrder = TRACK_LAYOUT_PRESET_ORDER[presetName]
+      audioTransport.stopAll()
+      set((state) => ({
+        ...applyTrackRoleOrderToState(state, roleOrder, presetName),
+        queuedSceneLabel: null,
+        saveStatus: 'dirty',
+        lastAction: `Layout preset applied: ${presetName}`,
+      }))
+    },
+
+    moveTrackColumnLeft: (trackIndex) => {
+      if (trackIndex <= 0) {
+        return
+      }
+
+      audioTransport.stopAll()
+      set((state) => {
+        const roleOrder = getRoleOrderFromTracks(state.tracks)
+        const nextRoleOrder = moveArrayItem(roleOrder, trackIndex, trackIndex - 1)
+        return {
+          ...applyTrackRoleOrderToState(state, nextRoleOrder),
+          queuedSceneLabel: null,
+          saveStatus: 'dirty',
+          lastAction: `Moved column left: ${getTrackLabel(state.tracks, trackIndex)}`,
+        }
+      })
+    },
+
+    moveTrackColumnRight: (trackIndex) => {
+      const maxIndex = get().tracks.length - 1
+      if (trackIndex >= maxIndex) {
+        return
+      }
+
+      audioTransport.stopAll()
+      set((state) => {
+        const roleOrder = getRoleOrderFromTracks(state.tracks)
+        const nextRoleOrder = moveArrayItem(roleOrder, trackIndex, trackIndex + 1)
+        return {
+          ...applyTrackRoleOrderToState(state, nextRoleOrder),
+          queuedSceneLabel: null,
+          saveStatus: 'dirty',
+          lastAction: `Moved column right: ${getTrackLabel(state.tracks, trackIndex)}`,
+        }
+      })
+    },
+
+    resetTrackOrder: () => {
+      audioTransport.stopAll()
+      set((state) => ({
+        ...applyTrackRoleOrderToState(state, [...DEFAULT_ROLE_ORDER], DEFAULT_LAYOUT_PRESET),
+        queuedSceneLabel: null,
+        saveStatus: 'dirty',
+        lastAction: 'Column order reset to Classic',
+      }))
+    },
 
     autoFillGrid: () =>
       set((state) => {
@@ -1845,10 +2568,10 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         audioTransport.stopAll()
 
         const settings = state.autoFillSettings
-        const source = resolveAutoFillSource(state.samples, state.activePack, settings.sourceScope)
+        const source = resolveAutoFillSource(state.samples, state.tracks, state.activePack, settings.sourceScope)
         const sourceSamples = source.sourceSamples.length > 0 ? source.sourceSamples : state.samples
         const chosenPack = source.chosenPack
-        const coverageLabel = getCoverageLabel(sourceSamples)
+        const coverageLabel = getCoverageLabel(sourceSamples, state.tracks)
         const siblingSamples =
           chosenPack !== null
             ? state.samples.filter((sample) => getSamplePack(sample) !== chosenPack)
@@ -1860,21 +2583,42 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           !settings.preferSameFolder
 
         const inferredBpm = settings.targetBpm ?? inferMostCommonBpm(sourceSamples)
-        const inferredKey = settings.targetKey ?? inferMostCommonKey(sourceSamples)
+        const inferredKey = resolveActiveHarmonicTargetKey(
+          settings.targetKey,
+          state.activeKeyFilter,
+          state.transport,
+          sourceSamples,
+        )
 
         const nextClips = state.clips.map((clip) => {
-          const categoryTargets = getCategoryTargets(clip.trackIndex)
-          const isFxTrack = clip.trackIndex === 7
+          const track = state.tracks[clip.trackIndex]
+          if (!track) {
+            return emptyClip(clip)
+          }
 
-          let candidates = sourceSamples.filter((sample) => categoryTargets.includes(sample.category))
+          const categoryTargets = getCategoryTargets(track)
+          const isFxTrack = track.role === 'fx'
+
+          let candidates = sourceSamples.filter(
+            (sample) => categoryTargets.includes(sample.category) && !sample.excluded,
+          )
           if (candidates.length === 0 && shouldUseSiblingFallback) {
-            candidates = siblingSamples.filter((sample) => categoryTargets.includes(sample.category))
+            candidates = siblingSamples.filter(
+              (sample) => categoryTargets.includes(sample.category) && !sample.excluded,
+            )
           }
 
           if (settings.allowOneShotsInFXOnly && !isFxTrack) {
             const withoutOneShots = candidates.filter((sample) => sample.type !== 'one-shot')
             if (withoutOneShots.length > 0) {
               candidates = withoutOneShots
+            }
+          }
+
+          if (!track.allowOneShots) {
+            const loopOrUnknown = candidates.filter((sample) => sample.type !== 'one-shot')
+            if (loopOrUnknown.length > 0) {
+              candidates = loopOrUnknown
             }
           }
 
@@ -1892,18 +2636,31 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           const ranked = candidates
             .map((sample) => ({
               sample,
-              score: scoreSampleCandidate(
-                sample,
-                clip.trackIndex,
-                chosenPack,
-                inferredBpm,
-                inferredKey,
-                settings,
-              ),
+              score: scoreSampleCandidate(sample, track, chosenPack, inferredBpm, inferredKey, settings),
             }))
             .sort((left, right) => right.score - left.score)
 
-          const selected = ranked[clip.sceneIndex % ranked.length]?.sample
+          const validRanked = ranked.filter((entry) => Number.isFinite(entry.score))
+          if (validRanked.length === 0) {
+            return emptyClip(clip)
+          }
+
+          let selectionPool = validRanked
+          if (settings.keyStrictness === 'strict' && inferredKey && !isKeyNeutralTrack(track)) {
+            const exactMatches = validRanked.filter((entry) =>
+              areKeysExactMatch(getSampleEffectiveKey(entry.sample), inferredKey),
+            )
+            if (exactMatches.length > 0) {
+              selectionPool = exactMatches
+            } else if (settings.allowUnknownKeySamples) {
+              const unknownOnly = validRanked.filter((entry) => !getSampleEffectiveKey(entry.sample))
+              if (unknownOnly.length > 0) {
+                selectionPool = unknownOnly
+              }
+            }
+          }
+
+          const selected = selectionPool[clip.sceneIndex % selectionPool.length]?.sample
           if (!selected) {
             return emptyClip(clip)
           }
@@ -1934,10 +2691,12 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           missingFilesCount: 0,
           queuedSceneLabel: null,
           autoFillResolvedSource: source.sourceLabel,
+          autoFillResolvedSourceReason: source.sourceReason,
+          autoFillResolvedKey: inferredKey,
           autoFillCoverageLabel: coverageLabel,
           saveStatus: 'dirty',
           lastAction: `Auto Fill complete (${source.sourceLabel})${inferredBpm ? ` @ ${inferredBpm} BPM` : ''}${inferredKey ? `, ${inferredKey}` : ''}`,
-          playbackEngineStatus: 'Playback engine: browser prototype',
+          playbackEngineStatus: 'Browser playback engine',
         }
       }),
 
@@ -2125,13 +2884,16 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     },
 
     selectTrack: (trackId) =>
-      set((state) => ({
-        tracks: state.tracks.map((track) => ({
-          ...track,
-          selected: track.id === trackId,
-        })),
-        lastAction: `Selected track ${trackId}`,
-      })),
+      set((state) => {
+        const selectedTrack = state.tracks.find((track) => track.id === trackId)
+        return {
+          tracks: state.tracks.map((track) => ({
+            ...track,
+            selected: track.id === trackId,
+          })),
+          lastAction: `Selected track: ${selectedTrack?.label ?? trackId}`,
+        }
+      }),
 
     toggleTrackArm: (trackId) =>
       set((state) => ({
@@ -2159,7 +2921,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
     stopTrack: (trackIndex) => {
       const state = get()
-      const trackLabel = TRACK_LABELS[trackIndex] ?? `Track ${trackIndex + 1}`
+      const trackLabel = getTrackLabel(state.tracks, trackIndex)
 
       if (state.transport.quantize === 'None' || !state.transport.isPlaying) {
         stopTrackNow(trackIndex)
@@ -2281,7 +3043,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     clearColumn: (trackIndex) => {
       const state = get()
       const snapshot = createClearSnapshot(state, 'Undo clear column')
-      const columnLabel = TRACK_LABELS[trackIndex] ?? `Track ${trackIndex + 1}`
+      const columnLabel = getTrackLabel(state.tracks, trackIndex)
       const columnClips = state.clips.filter((clip) => clip.trackIndex === trackIndex)
       for (const clip of columnClips) {
         if (!clip.playing) {
@@ -2410,11 +3172,11 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
             id: `msg-${Date.now()}-assistant`,
             role: 'assistant',
             content:
-              'Local mock response: this action is UI logic only. Backend AI orchestration is not wired yet.',
+              'AI actions are coming soon. Local helper actions are available right now.',
           },
         ],
         assistantInput: '',
-        lastAction: 'Assistant prompt submitted (local mock)',
+        lastAction: 'Assistant prompt submitted in local preview mode',
       })
     },
 

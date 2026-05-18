@@ -47,7 +47,7 @@ body {
   background: transparent;
   padding: 0;
   font-size: 0.75rem;
-  color: #f8fafc;
+  color: #d6dce2;
   outline: none;
 }
 
@@ -144,4 +144,20 @@ body {
 
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* Dark dropdown fixes */
+
+select {
+  color-scheme: dark;
+}
+
+select option {
+  background-color: #0f172a;
+  color: #e5e7eb;
+}
+
+select option:checked {
+  background-color: #1e293b;
+  color: #ffffff;
 }

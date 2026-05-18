@@ -61,6 +61,8 @@ function normalizeManifestPayload(payload) {
     key: payload.key ?? 'C',
     scale: payload.scale ?? 'Minor',
     autoFillSettings: payload.autoFillSettings ?? null,
+    layoutPresetName: payload.layoutPresetName ?? null,
+    tracks: Array.isArray(payload.tracks) ? payload.tracks : [],
     clips: Array.isArray(payload.clips) ? payload.clips : [],
   }
 }

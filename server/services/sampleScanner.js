@@ -1,6 +1,7 @@
-﻿import { readdir } from 'node:fs/promises'
+import { readdir } from 'node:fs/promises'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
+import { parseKey } from './musicTheory.js'
 
 const AUDIO_EXTENSIONS = new Set(['.wav', '.aiff', '.aif', '.mp3', '.flac', '.ogg'])
 
@@ -18,38 +19,14 @@ export const CATEGORY_NAMES = [
 ]
 
 const CATEGORY_KEYWORDS = [
-  {
-    category: 'Drums',
-    keywords: ['kick', 'snare', 'clap', 'beat', 'drum'],
-  },
-  {
-    category: 'Hats / Perc',
-    keywords: ['hat', 'perc', 'shaker', 'ride', 'crash'],
-  },
-  {
-    category: 'Bass',
-    keywords: ['bass', 'sub', '808'],
-  },
-  {
-    category: 'Instrument / Chord',
-    keywords: ['chord', 'pad', 'keys', 'piano', 'synth'],
-  },
-  {
-    category: 'Melody',
-    keywords: ['melody', 'lead', 'arp', 'pluck'],
-  },
-  {
-    category: 'Guitar / Texture',
-    keywords: ['guitar', 'texture', 'ambience', 'ambient'],
-  },
-  {
-    category: 'Vocal',
-    keywords: ['vocal', 'vox', 'voice', 'maya'],
-  },
-  {
-    category: 'FX',
-    keywords: ['fx', 'riser', 'impact', 'downer', 'sweep', 'noise'],
-  },
+  { category: 'Drums', keywords: ['kick', 'snare', 'clap', 'beat', 'drum'] },
+  { category: 'Hats / Perc', keywords: ['hat', 'perc', 'shaker', 'ride', 'crash'] },
+  { category: 'Bass', keywords: ['bass', 'sub', '808'] },
+  { category: 'Instrument / Chord', keywords: ['chord', 'pad', 'keys', 'piano', 'synth'] },
+  { category: 'Melody', keywords: ['melody', 'lead', 'arp', 'pluck'] },
+  { category: 'Guitar / Texture', keywords: ['guitar', 'texture', 'ambience', 'ambient'] },
+  { category: 'Vocal', keywords: ['vocal', 'vox', 'voice', 'maya'] },
+  { category: 'FX', keywords: ['fx', 'riser', 'impact', 'downer', 'sweep', 'noise'] },
 ]
 
 const LOOP_KEYWORDS = [
@@ -69,15 +46,7 @@ const LOOP_KEYWORDS = [
   'guitar',
 ]
 
-const EXPLICIT_ONESHOT_KEYWORDS = [
-  'one-shot',
-  'oneshot',
-  'single',
-  'hit',
-  'impact',
-  'stab',
-  'shot',
-]
+const EXPLICIT_ONESHOT_KEYWORDS = ['one-shot', 'oneshot', 'single', 'hit', 'impact', 'stab', 'shot']
 
 const DRUM_HIT_KEYWORDS = [
   'kick',
@@ -92,13 +61,6 @@ const DRUM_HIT_KEYWORDS = [
   'chh',
   'ohh',
 ]
-
-const MAJOR_MINOR_MAP = {
-  maj: 'Major',
-  major: 'Major',
-  min: 'Minor',
-  minor: 'Minor',
-}
 
 function normalizeForMatch(value) {
   return value.toLowerCase().replace(/[^a-z0-9#b]+/g, ' ')
@@ -118,7 +80,6 @@ function inferCategory(value) {
 
 function inferType(value) {
   const normalized = normalizeForMatch(value)
-
   const hasLoopKeyword = LOOP_KEYWORDS.some((keyword) => normalized.includes(keyword))
 
   if (EXPLICIT_ONESHOT_KEYWORDS.some((keyword) => normalized.includes(keyword))) {
@@ -173,25 +134,38 @@ function inferBpm(value) {
   return null
 }
 
-function inferKey(value) {
-  const normalized = value.replace(/[_-]/g, ' ')
-  const keyWithMode = normalized.match(
-    /(?:^|[\s()[\]{}])([A-G](?:#|b)?)(?:\s*)(major|minor|maj|min|m)(?:$|[\s()[\]{}])/i,
-  )
-
-  if (keyWithMode) {
-    const note = keyWithMode[1].toUpperCase()
-    const modeRaw = keyWithMode[2].toLowerCase()
-    const mode = modeRaw === 'm' ? 'Minor' : MAJOR_MINOR_MAP[modeRaw] ?? 'Major'
-    return `${note} ${mode}`
+function inferKeyMetadata(relativePath, filename) {
+  const filenameStem = filename.replace(/\.[a-z0-9]{2,5}$/i, '')
+  const filenameParsed = parseKey(filenameStem)
+  if (filenameParsed) {
+    return {
+      key: filenameParsed.normalizedKey,
+      parsedKey: filenameParsed.parsedKey,
+      normalizedKey: filenameParsed.normalizedKey,
+      keySource: 'filename',
+      keyConfidence: filenameParsed.confidence,
+    }
   }
 
-  const noteOnly = normalized.match(/\b([A-G](?:#|b)?)\b/i)
-  if (noteOnly) {
-    return noteOnly[1].toUpperCase()
+  const folderCandidate = path.dirname(relativePath)
+  const folderParsed = parseKey(folderCandidate)
+  if (folderParsed) {
+    return {
+      key: folderParsed.normalizedKey,
+      parsedKey: folderParsed.parsedKey,
+      normalizedKey: folderParsed.normalizedKey,
+      keySource: 'folder',
+      keyConfidence: folderParsed.confidence === 'high' ? 'medium' : folderParsed.confidence,
+    }
   }
 
-  return null
+  return {
+    key: null,
+    parsedKey: null,
+    normalizedKey: null,
+    keySource: 'unknown',
+    keyConfidence: 'low',
+  }
 }
 
 function inferTags(relativePath, category, type) {
@@ -264,7 +238,7 @@ function createSampleRecord(absolutePath, sampleRoot) {
   const loopConfidence = inferLoopConfidence(searchable, type)
   const detectedBpm = inferBpm(searchable)
   const bpmSource = detectedBpm !== null ? 'filename' : 'unknown'
-  const key = inferKey(searchable)
+  const keyMeta = inferKeyMetadata(relativePath, filename)
 
   return {
     id: fileId(absolutePath),
@@ -275,7 +249,12 @@ function createSampleRecord(absolutePath, sampleRoot) {
     bpm: detectedBpm,
     detectedBpm,
     bpmSource,
-    key,
+    key: keyMeta.key,
+    parsedKey: keyMeta.parsedKey,
+    normalizedKey: keyMeta.normalizedKey,
+    keySource: keyMeta.keySource,
+    keyConfidence: keyMeta.keyConfidence,
+    excluded: false,
     type,
     loopConfidence,
     duration: null,

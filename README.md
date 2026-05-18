@@ -22,6 +22,13 @@ Current focus:
 - Drag-and-drop from browser results into grid clips
 - Browser double-click sample to load into selected clip
 - 8x8 session grid clip playback
+- Track Role system (role-driven columns instead of hardcoded column logic)
+- Column reorder (move left/right, role-aware remap of clips + controls)
+- Layout presets:
+  - Classic
+  - Vocal First
+  - Instrument First
+  - Performance
 - Quantized clip/scene launch queue
 - One clip per column/track rule
 - Scene launch switching per column
@@ -33,6 +40,15 @@ Current focus:
   - Selected Pack
   - Auto Best Pack
   - Entire Library
+- Context-aware explorer groups that scope Categories/BPM/Key/Type counts to the selected pack
+- Auto Fill respects current Track Role layout and accepted categories per column
+- Live-role metadata on tracks (Instrument + Vocal marked `LIVE` for future capture workflows)
+- Launchpad Pro MK3 planning schema (`src/hardware/launchpadProMapping.ts`)
+- Harmonic Intelligence Layer v1:
+  - normalized key parsing with enharmonic handling
+  - strict / compatible / off key matching
+  - manual key overrides + per-sample Auto Fill exclusion
+  - persisted overrides in `.launchbrain/sample-overrides.json`
 - Lightweight session manifest save/load (`.launchbrain/sessions/*.json`)
 
 ## Session Launch Behavior
@@ -93,12 +109,104 @@ Current focus:
 - Grid header shows resolved source context, coverage, target BPM, key, and mode.
 - Default BPM tolerance is `3` for tighter loop coherence.
 
+## Track Role System
+
+- Columns are now rendered from role config, not fixed hardcoded label arrays.
+- Each track column carries role metadata:
+  - `role`, `label`, `shortLabel`, `icon`, `color`
+  - `acceptedCategories`
+  - `preferredTypes`
+  - `liveInput`, `inputType`, `futureDevice`
+  - `allowOneShots`, `launchRule`, `hardwareColumnIndex`
+- Auto Fill scoring and filtering uses the current role config per column.
+- Wrong category filling is avoided; empty slots are preferred over mismatched assignments.
+
+### Column Reorder
+
+- Move columns left/right from each track header.
+- Reordering remaps:
+  - column header
+  - track controls
+  - clip assignments
+- Reorder is role-aware and updates track metadata/indexes for future hardware mapping.
+
+### Layout Presets
+
+- Available presets:
+  - `Classic`
+  - `Vocal First`
+  - `Instrument First`
+  - `Performance`
+- Applying a preset remaps columns by role (not by fixed index assumptions).
+- Preset selector is available in Session Grid options and Session inspector tab.
+
+## Harmonic Intelligence Layer v1
+
+- Key parsing now uses safer token boundaries (spaces, `_`, `-`, brackets, folder separators).
+- Parsing supports formats like:
+  - `Gm`, `Gmin`, `G minor`
+  - `F#min`, `Bb_major`, `Ab Maj`
+- False positives inside words are reduced (for example `Em` in `Stem` is ignored).
+- Every scanned sample now carries:
+  - `parsedKey`
+  - `normalizedKey`
+  - `keySource` (`filename` / `folder` / `manual` / `unknown`)
+  - `keyConfidence` (`high` / `medium` / `low`)
+
+Compatibility modes:
+- `off`: key is ignored
+- `strict`: exact normalized key only
+- `compatible`: exact + relative/parallel + simple adjacent fifth compatibility
+
+Unknown-key handling:
+- `allowUnknownKeySamples` is available in Auto Fill options
+- default `true` for compatible mode
+- default `false` for strict mode
+- `allowKeyNeutralStrict` keeps Drum / Drum 2-Hats / FX columns usable in strict mode even when samples are keyless
+
+Auto Fill harmonic context priority:
+1. Auto Fill explicit key (if set)
+2. Active key filter/group
+3. Project key + scale
+4. Most common key in the selected source
+
+Right-click tools on browser samples and grid clips:
+- Analyze Key
+- Set Key Manually
+- Mark Key Unknown
+- Use This Key as Project Key
+- Exclude/Include From Current Auto Fill
+- Show Metadata
+- `Transpose / Change Key to Project Key` (placeholder, disabled)
+
+## Sample Overrides
+
+- User metadata corrections are stored in:
+  - `.launchbrain/sample-overrides.json`
+- Overrides are path-based (relative to sample root), no audio copy/move is performed.
+- Current fields:
+  - `manualKey`
+  - `manualBpm`
+  - `excluded`
+  - `notes`
+- Overrides are applied automatically on scan and when loading cached index.
+
+Overrides API:
+- `GET /api/overrides`
+- `POST /api/overrides/sample`
+- `DELETE /api/overrides/sample`
+
 ## Session Save/Load (Lightweight)
 
 - Sessions are saved as JSON manifests in:
   - `.launchbrain/sessions/`
 - Audio files are never copied or moved.
 - Manifests only store references (`absolutePath`, `relativePath`, metadata, grid position).
+- Manifest now also stores:
+  - track role config/order
+  - layout preset name
+  - transport + harmonic settings
+  - Auto Fill settings + selected pack context
 - Save/Load controls are available in the top-bar session menu:
   - Save Set
   - Save Set As
@@ -120,10 +228,13 @@ server/
     deviceRoutes.js
     fsRoutes.js
     sessionRoutes.js
+    overridesRoutes.js
   services/
     configStore.js
     sampleScanner.js
     sampleIndexStore.js
+    overridesStore.js
+    musicTheory.js
     audioDevices.js
     midiDevices.js
     fsBrowser.js
@@ -132,11 +243,13 @@ server/
 src/
   components/
   data/
+  hardware/
   features/
   pages/
   services/
   store/
   types/
+  utils/
 ```
 
 ## Run Locally (Windows)
@@ -178,7 +291,19 @@ npm run dev:client
 2. Click the same active sample again to stop preview.
 3. Drag a sample from browser results onto any grid slot to assign it.
 4. Double-click a sample to load it into the currently selected clip.
-5. Use right-click on a clip for play/stop, replace, and clear actions.
+5. Manual clip loading now prepares the clip through the transport sync pipeline before use.
+6. Use right-click on a clip for play/stop, replace, and clear actions.
+
+## Regression Checklist
+
+1. Auto Fill a `D Minor` strict pattern.
+2. Confirm Drum / Drum 2-Hats / FX columns still fill with key-neutral material.
+3. Start two loops at the same BPM and confirm they stay synchronized.
+4. Drag a drum loop manually into the Drum column.
+5. Trigger it with another loop and confirm the beat meter keeps running.
+6. Switch clips in the same column and confirm one-clip-per-column still holds.
+7. Select a pack and confirm Categories / BPM / Key / Type groups update to that pack only.
+8. Clear the pack selection and confirm explorer groups return to the entire library.
 
 ## Build + Start
 
@@ -227,9 +352,14 @@ Set sample root to:
 - Clips with different BPM are not warped to project tempo
 - Loop sync currently uses playbackRate, so pitch can change
 - Bad trims or wrong BPM metadata can still produce imperfect loop feel
+- Browser preview is intentionally separate from the transport engine; preview should not affect session timing
 - Session manifests reference local files; moving/renaming files can cause missing clips
 - BPM/key detection is filename/folder heuristic (not audio analysis)
-- No harmonic matching engine yet
+- Audio key analysis endpoint is currently a truthful placeholder (manual key override is the working path)
+- Manual key override updates metadata only (it does not transpose audio)
+- Real non-destructive pitch-shifting / key change to project key is not implemented yet
+- Launchpad Pro MK3 mapping schema is planning-only in this step (no live MIDI control wired yet)
+- Live input roles (Instrument/Vocal) are metadata + UX indicators only; capture/recording is not active yet
 - No MIDI hardware control/mapping yet
 - No recording pipeline yet
 - No mixer/timeline/VST/arrangement features yet

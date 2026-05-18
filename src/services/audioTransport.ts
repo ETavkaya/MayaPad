@@ -1,4 +1,10 @@
-import type { ClipSyncStatus, SampleType, TransportState } from '../types'
+import type {
+  BpmSource,
+  ClipSyncStatus,
+  SampleType,
+  TransportDiagnostics,
+  TransportState,
+} from '../types'
 import { getSampleStreamUrl } from './api'
 
 const LOOKAHEAD_SECONDS = 0.18
@@ -13,7 +19,7 @@ export interface TransportClipRequest {
   type: SampleType
   bpm: number | null
   detectedBpm: number | null
-  bpmSource: 'filename' | 'estimated' | 'unknown'
+  bpmSource: BpmSource
   beatsLength: number | null
   estimatedBeats: number | null
 }
@@ -21,7 +27,7 @@ export interface TransportClipRequest {
 export interface ClipSyncSnapshot {
   durationSeconds: number | null
   detectedBpm: number | null
-  bpmSource: 'filename' | 'estimated' | 'unknown'
+  bpmSource: BpmSource
   estimatedBeats: number | null
   beatsLength: number | null
   syncStatus: ClipSyncStatus
@@ -303,6 +309,21 @@ class AudioTransport {
     return Math.floor(this.getCurrentBeat() / beatsPerBar) + 1
   }
 
+  getDiagnostics(): TransportDiagnostics {
+    const context = this.audioContext
+
+    return {
+      audioContextState: context?.state ?? 'uninitialized',
+      transportRunning: this.isPlaying,
+      transportStartTime: context ? this.transportStartedAt : null,
+      currentAudioTime: context?.currentTime ?? null,
+      currentBeat: context ? this.getCurrentBeatRaw(context.currentTime) : 0,
+      nextBoundaryTime: context ? this.getNextBoundaryTime() : null,
+      queuedEventsCount: this.queueEvents.length,
+      playingClipsCount: this.activeVoices.size,
+    }
+  }
+
   getNextBoundaryTime(quantizeOverride?: TransportState['quantize']) {
     const context = this.audioContext
     if (!context) {
@@ -361,6 +382,11 @@ class AudioTransport {
     return targetTime
   }
 
+  async prepareClipForPlayback(clip: TransportClipRequest): Promise<ClipSyncSnapshot> {
+    const prepared = await this.prepareClip(clip)
+    return prepared.sync
+  }
+
   async queueClipStop(
     input: {
       clipId: string
@@ -404,6 +430,31 @@ class AudioTransport {
     this.queueEvents = this.queueEvents.filter((event) => event.trackIndex !== trackIndex)
   }
 
+  stopClipImmediately(clipId: string) {
+    this.queueEvents = this.queueEvents.filter((event) => event.clipId !== clipId)
+    this.pendingStateEvents = this.pendingStateEvents.filter((event) => event.clipId !== clipId)
+
+    const voice = this.activeVoices.get(clipId)
+    if (!voice) {
+      return
+    }
+
+    try {
+      if (voice.kind === 'one-shot') {
+        voice.source.stop()
+      } else {
+        for (const segment of voice.segments) {
+          segment.source.stop()
+        }
+      }
+    } catch {
+      // Best effort cleanup for clip replacement.
+    }
+
+    this.activeVoices.delete(clipId)
+    this.activeClipByTrack.delete(voice.trackIndex)
+  }
+
   private async ensureAudioContext() {
     if (!this.audioContext) {
       const AudioContextCtor =
@@ -437,8 +488,17 @@ class AudioTransport {
 
     const tick = () => {
       this.rafId = requestAnimationFrame(tick)
-      this.processAudioTimeline()
-      this.publishClock()
+      try {
+        this.processAudioTimeline()
+      } catch (error) {
+        console.debug('LaunchBrain transport timeline error', error)
+      }
+
+      try {
+        this.publishClock()
+      } catch (error) {
+        console.debug('LaunchBrain transport clock publish error', error)
+      }
 
       if (!this.isPlaying && this.activeVoices.size === 0 && this.queueEvents.length === 0 && this.pendingStateEvents.length === 0) {
         this.cancelLoop()
@@ -470,12 +530,23 @@ class AudioTransport {
 
     for (const event of due) {
       event.dispatched = true
-      if (event.type === 'stop') {
-        this.processStopEvent(event)
-        continue
-      }
+      try {
+        if (event.type === 'stop') {
+          this.processStopEvent(event)
+          continue
+        }
 
-      void this.processStartEvent(event)
+        void this.processStartEvent(event)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unable to process transport event'
+        this.emit({
+          type: 'clip-error',
+          clipId: event.clipId,
+          trackIndex: event.trackIndex,
+          filename: event.filename,
+          message,
+        })
+      }
     }
 
     this.queueEvents = this.queueEvents.filter((event) => !event.dispatched)
@@ -485,7 +556,12 @@ class AudioTransport {
         continue
       }
 
-      this.scheduleLoopSegments(voice, horizon)
+      try {
+        this.scheduleLoopSegments(voice, horizon)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unable to keep loop in sync'
+        this.handleVoiceError(voice, message)
+      }
     }
 
     this.flushStateEvents(now)
@@ -636,6 +712,30 @@ class AudioTransport {
         message,
       })
     }
+  }
+
+  private handleVoiceError(voice: ActiveVoice, message: string) {
+    try {
+      if (voice.kind === 'one-shot') {
+        voice.source.stop()
+      } else {
+        for (const segment of voice.segments) {
+          segment.source.stop()
+        }
+      }
+    } catch {
+      // Keep transport clock alive even if a source stop throws.
+    }
+
+    this.activeVoices.delete(voice.clipId)
+    this.activeClipByTrack.delete(voice.trackIndex)
+    this.emit({
+      type: 'clip-error',
+      clipId: voice.clipId,
+      trackIndex: voice.trackIndex,
+      filename: voice.filename,
+      message,
+    })
   }
 
   private scheduleLoopSegments(voice: ActiveLoopVoice, horizon: number) {
@@ -812,6 +912,10 @@ class AudioTransport {
         return response.arrayBuffer()
       })
       .then((arrayBuffer) => context.decodeAudioData(arrayBuffer.slice(0)))
+      .catch((error) => {
+        this.decodeCache.delete(sampleId)
+        throw error
+      })
 
     this.decodeCache.set(sampleId, promise)
 

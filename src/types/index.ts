@@ -6,6 +6,28 @@
   | 'Session'
   | 'Routing'
 
+export type TrackRoleId =
+  | 'drum'
+  | 'drum2_hats'
+  | 'bass'
+  | 'instrument_chord'
+  | 'melody'
+  | 'guitar_texture'
+  | 'vocal'
+  | 'fx'
+
+export type TrackIconName =
+  | 'drum'
+  | 'hats'
+  | 'bass'
+  | 'instrument'
+  | 'melody'
+  | 'guitar'
+  | 'vocal'
+  | 'fx'
+
+export type LayoutPresetName = 'Classic' | 'Vocal First' | 'Instrument First' | 'Performance'
+
 export type TrackCategory =
   | 'Drum'
   | 'Drum 2 / Hats'
@@ -20,8 +42,12 @@ export type SampleType = 'loop' | 'one-shot' | 'unknown'
 export type ClipLaunchState = 'empty' | 'stopped' | 'queued' | 'playing' | 'stopping'
 export type AutoFillSourceScope = 'selectedPack' | 'entireLibrary' | 'autoBestPack'
 export type KeyStrictness = 'off' | 'compatible' | 'strict'
-export type BpmSource = 'filename' | 'estimated' | 'unknown'
+export type BpmSource = 'filename' | 'estimated' | 'manual' | 'unknown'
 export type ClipSyncStatus = 'ready' | 'bpm_missing' | 'length_uncertain' | 'unsupported'
+export type KeySource = 'filename' | 'folder' | 'manual' | 'analysis' | 'unknown'
+export type KeyConfidence = 'high' | 'medium' | 'low'
+export type TrackInputType = 'midi' | 'audio' | null
+export type TrackLaunchRule = 'oneClipPerColumn'
 
 export interface TransportState {
   isPlaying: boolean
@@ -76,6 +102,11 @@ export interface SampleRecord {
   detectedBpm: number | null
   bpmSource: BpmSource
   key: string | null
+  parsedKey: string | null
+  normalizedKey: string | null
+  keySource: KeySource
+  keyConfidence: KeyConfidence
+  excluded: boolean
   type: SampleType
   loopConfidence: 'high' | 'medium' | 'low'
   duration: number | null
@@ -115,6 +146,8 @@ export interface AutoFillSettings {
   bpmTolerance: number
   targetKey: string | null
   keyStrictness: KeyStrictness
+  allowUnknownKeySamples: boolean
+  allowKeyNeutralStrict: boolean
   preferLoops: boolean
   allowOneShotsInFXOnly: boolean
   preferSameFolder: boolean
@@ -129,11 +162,39 @@ export interface ScanResult {
   samples: SampleRecord[]
 }
 
+export interface TrackRoleDefinition {
+  role: TrackRoleId
+  label: TrackCategory
+  shortLabel: string
+  color: string
+  icon: TrackIconName
+  acceptedCategories: string[]
+  preferredTypes: SampleType[]
+  keyNeutral: boolean
+  liveInput: boolean
+  inputType: TrackInputType
+  futureDevice: string | null
+  allowOneShots: boolean
+  launchRule: TrackLaunchRule
+}
+
 export interface Track {
   id: string
   index: number
+  role: TrackRoleId
   label: TrackCategory
+  shortLabel: string
   color: string
+  icon: TrackIconName
+  acceptedCategories: string[]
+  preferredTypes: SampleType[]
+  keyNeutral: boolean
+  liveInput: boolean
+  inputType: TrackInputType
+  futureDevice: string | null
+  allowOneShots: boolean
+  launchRule: TrackLaunchRule
+  hardwareColumnIndex: number
   armed: boolean
   muted: boolean
   solo: boolean
@@ -151,6 +212,11 @@ export interface ClipSlot {
   type: SampleType | null
   bpm: number | null
   key: string | null
+  parsedKey: string | null
+  normalizedKey: string | null
+  keySource: KeySource
+  keyConfidence: KeyConfidence
+  excluded: boolean
   absolutePath: string | null
   relativePath: string | null
   detectedBpm: number | null
@@ -201,6 +267,11 @@ export interface SessionManifestClip {
   type: SampleType | null
   bpm: number | null
   key: string | null
+  parsedKey?: string | null
+  normalizedKey?: string | null
+  keySource?: KeySource
+  keyConfidence?: KeyConfidence
+  excluded?: boolean
   detectedBpm?: number | null
   bpmSource?: BpmSource
   durationSeconds?: number | null
@@ -225,6 +296,26 @@ export interface SessionManifest {
   key: string
   scale: string
   autoFillSettings: AutoFillSettings
+  layoutPresetName?: LayoutPresetName | null
+  tracks?: Track[]
   clips: SessionManifestClip[]
   missingFilesCount?: number
+}
+
+export interface SampleOverrideRecord {
+  manualKey: string | null
+  manualBpm: number | null
+  excluded: boolean
+  notes: string
+}
+
+export interface TransportDiagnostics {
+  audioContextState: string
+  transportRunning: boolean
+  transportStartTime: number | null
+  currentAudioTime: number | null
+  currentBeat: number
+  nextBoundaryTime: number | null
+  queuedEventsCount: number
+  playingClipsCount: number
 }

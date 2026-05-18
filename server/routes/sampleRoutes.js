@@ -5,6 +5,7 @@ import path from 'node:path'
 import { readConfig, updateConfig } from '../services/configStore.js'
 import { persistSampleIndex, getLatestSampleIndex, getSampleById } from '../services/sampleIndexStore.js'
 import { scanSampleLibrary } from '../services/sampleScanner.js'
+import { applyOverridesToSamples, getSampleOverrides } from '../services/overridesStore.js'
 
 export const sampleRouter = Router()
 
@@ -30,7 +31,18 @@ function getContentType(filePath) {
 
 sampleRouter.get('/samples/index', async (_req, res) => {
   const latestIndex = getLatestSampleIndex()
-  res.json(latestIndex ?? null)
+  if (!latestIndex) {
+    return res.json(null)
+  }
+
+  const overrides = await getSampleOverrides().catch(() => ({}))
+  const samples = applyOverridesToSamples(latestIndex.samples ?? [], overrides)
+
+  return res.json({
+    ...latestIndex,
+    sampleCount: samples.length,
+    samples,
+  })
 })
 
 sampleRouter.get('/samples/scan', async (_req, res, next) => {
@@ -49,13 +61,33 @@ sampleRouter.get('/samples/scan', async (_req, res, next) => {
     }
 
     const scanResult = await scanSampleLibrary(config.sampleRoot)
+    const overrides = await getSampleOverrides().catch(() => ({}))
+    const scanWithOverrides = {
+      ...scanResult,
+      samples: applyOverridesToSamples(scanResult.samples ?? [], overrides),
+    }
     await updateConfig({ lastScanAt: scanResult.scannedAt })
-    await persistSampleIndex(scanResult)
+    await persistSampleIndex(scanWithOverrides)
 
-    return res.json(scanResult)
+    return res.json(scanWithOverrides)
   } catch (error) {
     next(error)
   }
+})
+
+sampleRouter.get('/samples/:id/analyze-key', async (req, res) => {
+  const sample = getSampleById(req.params.id)
+  if (!sample) {
+    return res.status(404).json({ error: 'Sample not found in latest index.' })
+  }
+
+  return res.json({
+    sampleId: sample.id,
+    available: false,
+    status: 'not_available',
+    message: 'Audio key analysis is not available yet. Use manual key override for now.',
+    normalizedKey: sample.normalizedKey ?? null,
+  })
 })
 
 sampleRouter.get('/samples/:id/stream', async (req, res, next) => {

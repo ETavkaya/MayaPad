@@ -16,7 +16,7 @@ export function AssistantPanel() {
     <Panel title="AI Assistant" className="flex h-full min-h-0 flex-col overflow-hidden">
       <div className="flex min-h-0 flex-1 flex-col">
         <div className="border-b border-slate-800 px-3 py-2 text-[11px] text-slate-400">
-          Local mock mode: assistant actions currently run frontend logic only.
+          Local preview mode: AI actions coming soon, local helpers are active.
         </div>
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-3">
           {assistantMessages.map((message) => (

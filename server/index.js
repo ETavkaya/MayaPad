@@ -5,11 +5,13 @@ import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { ensureConfigFile } from './services/configStore.js'
 import { initializeSampleIndex } from './services/sampleIndexStore.js'
+import { ensureOverrideFile } from './services/overridesStore.js'
 import { configRouter } from './routes/configRoutes.js'
 import { sampleRouter } from './routes/sampleRoutes.js'
 import { deviceRouter } from './routes/deviceRoutes.js'
 import { fsRouter } from './routes/fsRoutes.js'
 import { sessionRouter } from './routes/sessionRoutes.js'
+import { overridesRouter } from './routes/overridesRoutes.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -30,6 +32,7 @@ app.use('/api', sampleRouter)
 app.use('/api', deviceRouter)
 app.use('/api', fsRouter)
 app.use('/api', sessionRouter)
+app.use('/api', overridesRouter)
 
 if (existsSync(distPath)) {
   app.use(express.static(distPath))
@@ -55,6 +58,7 @@ const PORT = Number(process.env.PORT ?? 8010)
 
 async function start() {
   await ensureConfigFile()
+  await ensureOverrideFile()
   await initializeSampleIndex()
 
   app.listen(PORT, () => {

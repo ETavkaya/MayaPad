@@ -2,33 +2,14 @@
   AssistantMessage,
   ClipSlot,
   DeviceSnapshot,
+  LayoutPresetName,
   Scene,
   Track,
-  TrackCategory,
   TransportState,
 } from '../types'
+import { DEFAULT_LAYOUT_PRESET, TRACK_LAYOUT_PRESET_ORDER, buildTracksFromRoleOrder } from './trackRoles'
 
-export const TRACK_LABELS: TrackCategory[] = [
-  'Drum',
-  'Drum 2 / Hats',
-  'Bass',
-  'Instrument / Chord',
-  'Melody',
-  'Guitar / Texture',
-  'Vocal',
-  'FX',
-]
-
-export const TRACK_COLORS = [
-  '#ef4444',
-  '#f59e0b',
-  '#eab308',
-  '#84cc16',
-  '#14b8a6',
-  '#3b82f6',
-  '#8b5cf6',
-  '#ec4899',
-]
+export { DEFAULT_LAYOUT_PRESET } from './trackRoles'
 
 export const SCENE_LABELS = [
   'Intro',
@@ -71,7 +52,7 @@ export const DEFAULT_ASSISTANT_MESSAGES: AssistantMessage[] = [
   {
     id: 'msg-1',
     role: 'assistant',
-    content: 'Local copilot mode: actions are frontend workflows until backend AI integration is added.',
+    content: 'Local preview mode: AI actions currently trigger local workflow helpers.',
   },
   {
     id: 'msg-2',
@@ -85,17 +66,8 @@ export const DEFAULT_ASSISTANT_MESSAGES: AssistantMessage[] = [
   },
 ]
 
-export function createDefaultTracks(): Track[] {
-  return TRACK_LABELS.map((label, index) => ({
-    id: `track-${index + 1}`,
-    index,
-    label,
-    color: TRACK_COLORS[index],
-    armed: false,
-    muted: false,
-    solo: false,
-    selected: index === 0,
-  }))
+export function createDefaultTracks(layoutPreset: LayoutPresetName = DEFAULT_LAYOUT_PRESET): Track[] {
+  return buildTracksFromRoleOrder(TRACK_LAYOUT_PRESET_ORDER[layoutPreset])
 }
 
 export function createDefaultScenes(): Scene[] {
@@ -107,8 +79,9 @@ export function createDefaultScenes(): Scene[] {
 }
 
 export function createEmptyClips(): ClipSlot[] {
+  const trackCount = TRACK_LAYOUT_PRESET_ORDER[DEFAULT_LAYOUT_PRESET].length
   return SCENE_LABELS.flatMap((_, sceneIndex) =>
-    TRACK_LABELS.map((_, trackIndex) => ({
+    Array.from({ length: trackCount }, (_, trackIndex) => ({
       id: `clip-${sceneIndex + 1}-${trackIndex + 1}`,
       trackIndex,
       sceneIndex,
@@ -119,6 +92,11 @@ export function createEmptyClips(): ClipSlot[] {
       type: null,
       bpm: null,
       key: null,
+      parsedKey: null,
+      normalizedKey: null,
+      keySource: 'unknown',
+      keyConfidence: 'low',
+      excluded: false,
       absolutePath: null,
       relativePath: null,
       detectedBpm: null,

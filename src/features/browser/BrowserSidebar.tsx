@@ -1,9 +1,18 @@
-import { ChevronDown, ChevronRight, Folder, FolderOpen, Play, Search, Square } from 'lucide-react'
-import { useMemo } from 'react'
+import {
+  ChevronDown,
+  ChevronRight,
+  Folder,
+  FolderOpen,
+  Play,
+  Search,
+  Square,
+} from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
 import type { SampleType } from '../../types'
 import { Panel } from '../../components/ui/Panel'
 import { cn } from '../../components/ui/cn'
 import { useLaunchBrainStore } from '../../store/useLaunchBrainStore'
+import { ALL_MUSICAL_KEYS } from '../../utils/musicTheory'
 
 function samplePackName(relativePath: string) {
   const [pack] = relativePath.split(/[\\/]/)
@@ -77,6 +86,16 @@ function FilterItem({
 }
 
 export function BrowserSidebar() {
+  const [sampleContextMenu, setSampleContextMenu] = useState<{
+    sampleId: string
+    x: number
+    y: number
+  } | null>(null)
+  const [manualKeyModal, setManualKeyModal] = useState<{
+    sampleId: string
+    key: string
+  } | null>(null)
+
   const categories = useLaunchBrainStore((state) => state.categories)
   const samples = useLaunchBrainStore((state) => state.samples)
   const selectedSampleId = useLaunchBrainStore((state) => state.selectedSampleId)
@@ -120,6 +139,24 @@ export function BrowserSidebar() {
   const setActiveTypeFilter = useLaunchBrainStore((state) => state.setActiveTypeFilter)
   const clearLibraryFilters = useLaunchBrainStore((state) => state.clearLibraryFilters)
   const toggleExplorerGroup = useLaunchBrainStore((state) => state.toggleExplorerGroup)
+  const analyzeKeyForSample = useLaunchBrainStore((state) => state.analyzeKeyForSample)
+  const setSampleManualKey = useLaunchBrainStore((state) => state.setSampleManualKey)
+  const markSampleKeyUnknown = useLaunchBrainStore((state) => state.markSampleKeyUnknown)
+  const setSampleAsProjectKey = useLaunchBrainStore((state) => state.setSampleAsProjectKey)
+  const toggleSampleExcludedInAutoFill = useLaunchBrainStore(
+    (state) => state.toggleSampleExcludedInAutoFill,
+  )
+  const showSampleMetadata = useLaunchBrainStore((state) => state.showSampleMetadata)
+
+  useEffect(() => {
+    const closeMenu = () => setSampleContextMenu(null)
+    window.addEventListener('click', closeMenu)
+    window.addEventListener('contextmenu', closeMenu)
+    return () => {
+      window.removeEventListener('click', closeMenu)
+      window.removeEventListener('contextmenu', closeMenu)
+    }
+  }, [])
 
   const packCounts = useMemo(() => {
     return countBy(samples.map((sample) => samplePackName(sample.relativePath)))
@@ -131,9 +168,17 @@ export function BrowserSidebar() {
     )
   }, [packCounts])
 
+  const explorerScopeSamples = useMemo(() => {
+    if (!activePack) {
+      return samples
+    }
+
+    return samples.filter((sample) => samplePackName(sample.relativePath) === activePack)
+  }, [activePack, samples])
+
   const categoryCounts = useMemo(() => {
-    return countBy(samples.map((sample) => sample.category))
-  }, [samples])
+    return countBy(explorerScopeSamples.map((sample) => sample.category))
+  }, [explorerScopeSamples])
 
   const sortedCategoryEntries = useMemo(() => {
     const preferredOrder = categories.map((category) => category.name)
@@ -146,18 +191,22 @@ export function BrowserSidebar() {
   }, [categories, categoryCounts])
 
   const bpmCounts = useMemo(() => {
-    const values = samples.map((sample) => sample.bpm).filter((bpm): bpm is number => bpm !== null)
+    const values = explorerScopeSamples
+      .map((sample) => sample.detectedBpm ?? sample.bpm)
+      .filter((bpm): bpm is number => bpm !== null)
     return countBy(values)
-  }, [samples])
+  }, [explorerScopeSamples])
 
   const keyCounts = useMemo(() => {
-    const values = samples.map((sample) => sample.key).filter((key): key is string => Boolean(key))
+    const values = explorerScopeSamples
+      .map((sample) => sample.normalizedKey ?? sample.key)
+      .filter((key): key is string => Boolean(key))
     return countBy(values)
-  }, [samples])
+  }, [explorerScopeSamples])
 
   const typeCounts = useMemo(() => {
-    return countBy(samples.map((sample) => sample.type))
-  }, [samples])
+    return countBy(explorerScopeSamples.map((sample) => sample.type))
+  }, [explorerScopeSamples])
 
   const filteredSamples = useMemo(() => {
     return samples.filter((sample) => {
@@ -165,7 +214,8 @@ export function BrowserSidebar() {
       const matchesPack = !activePack || pack === activePack
       const matchesCategory = !activeCategoryFilter || sample.category === activeCategoryFilter
       const matchesBpm = activeBpmFilter === null || sample.bpm === activeBpmFilter
-      const matchesKey = !activeKeyFilter || sample.key === activeKeyFilter
+      const sampleKey = sample.normalizedKey ?? sample.key
+      const matchesKey = !activeKeyFilter || sampleKey === activeKeyFilter
       const matchesType = !activeTypeFilter || sample.type === activeTypeFilter
       const query = browserQuery.trim().toLowerCase()
       const matchesQuery =
@@ -187,19 +237,37 @@ export function BrowserSidebar() {
   ])
 
   const selectedTypeLabel = activeTypeFilter ?? 'Any'
+  const scopeLabel = activePack ? `Selected Pack - ${activePack}` : 'Entire Library'
   const selectedSourceLabel =
     autoFillSettings.sourceScope === 'selectedPack'
       ? 'selected pack'
       : autoFillSettings.sourceScope === 'autoBestPack'
         ? 'auto best pack'
         : 'entire library'
+  const contextSample = sampleContextMenu
+    ? samples.find((sample) => sample.id === sampleContextMenu.sampleId) ?? null
+    : null
 
   return (
     <>
       <Panel className="flex h-full min-h-0 flex-col overflow-hidden">
         <div className="min-h-0 space-y-3 overflow-y-auto p-3">
           <section className="space-y-2">
-            <h3 className="panel-label">Library Explorer</h3>
+            <div className="space-y-1">
+              <h3 className="panel-label">Library Explorer</h3>
+              <div className="flex items-center justify-between rounded-md border border-slate-800 bg-slate-900/45 px-2 py-1 text-[11px] text-slate-300">
+                <span className="truncate">Explorer Scope: {scopeLabel}</span>
+                {activePack ? (
+                  <button
+                    type="button"
+                    onClick={() => setActivePack(null)}
+                    className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-300 transition hover:border-slate-500"
+                  >
+                    Clear Pack
+                  </button>
+                ) : null}
+              </div>
+            </div>
 
             <FilterGroup
               title="Packs / Top-level Folders"
@@ -293,17 +361,28 @@ export function BrowserSidebar() {
           <section className="space-y-2">
             <div className="flex items-center justify-between">
               <h3 className="panel-label">Results</h3>
-              <button
-                type="button"
-                onClick={clearLibraryFilters}
-                className="rounded border border-slate-700 px-2 py-1 text-[10px] uppercase tracking-wide text-slate-300 transition hover:border-slate-500"
-              >
-                Clear Filters
-              </button>
+              <div className="flex items-center gap-1.5">
+                {activePack ? (
+                  <button
+                    type="button"
+                    onClick={() => setActivePack(null)}
+                    className="rounded border border-slate-700 px-2 py-1 text-[10px] uppercase tracking-wide text-slate-300 transition hover:border-slate-500"
+                  >
+                    Clear Pack
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={clearLibraryFilters}
+                  className="rounded border border-slate-700 px-2 py-1 text-[10px] uppercase tracking-wide text-slate-300 transition hover:border-slate-500"
+                >
+                  Clear Filters
+                </button>
+              </div>
             </div>
 
             <div className="rounded-md border border-slate-800 bg-slate-900/45 px-2 py-1.5 text-[11px] text-slate-300">
-              <p className="truncate">Selected pack: {activePack ?? 'Any'}</p>
+              <p className="truncate">Explorer Scope: {scopeLabel}</p>
               <p className="truncate">
                 Target BPM: {autoFillSettings.targetBpm ?? 'Auto'} | Key: {autoFillSettings.targetKey ?? 'Auto'}
               </p>
@@ -326,7 +405,9 @@ export function BrowserSidebar() {
             <div className="flex items-center gap-1.5">
               <button
                 type="button"
-                onClick={loadSelectedFileToSelectedClip}
+                onClick={() => {
+                  void loadSelectedFileToSelectedClip()
+                }}
                 className="flex-1 rounded border border-sky-500/40 bg-sky-500/15 px-2 py-1.5 text-xs text-sky-200 transition hover:bg-sky-500/25"
               >
                 Load To Clip
@@ -352,12 +433,23 @@ export function BrowserSidebar() {
                         event.dataTransfer.effectAllowed = 'copyMove'
                       }}
                       onClick={() => selectBrowserFile(sample.id)}
-                      onDoubleClick={() => loadSampleToSelectedClip(sample.id)}
+                      onDoubleClick={() => {
+                        void loadSampleToSelectedClip(sample.id)
+                      }}
+                      onContextMenu={(event) => {
+                        event.preventDefault()
+                        setSampleContextMenu({
+                          sampleId: sample.id,
+                          x: event.clientX,
+                          y: event.clientY,
+                        })
+                      }}
                       className={cn(
                         'w-full rounded-md border px-2 py-1.5 text-left transition',
                         selectedSampleId === sample.id
                           ? 'border-sky-500/40 bg-sky-500/10'
                           : 'border-slate-800 bg-slate-900/60 hover:border-slate-700',
+                        sample.excluded && 'border-amber-500/40 bg-amber-500/10',
                       )}
                     >
                       <p className="flex items-center justify-between gap-2 truncate text-xs font-medium text-slate-100">
@@ -370,7 +462,7 @@ export function BrowserSidebar() {
                         ) : null}
                       </p>
                       <p className="mt-0.5 truncate text-[11px] text-slate-400">
-                        {sample.bpm ?? '--'} BPM - {sample.key ?? '--'} - {sample.type}
+                        {sample.bpm ?? '--'} BPM - {sample.normalizedKey ?? sample.key ?? '--'} - {sample.type}
                       </p>
                       <p className="truncate text-[10px] text-slate-500">{pack}</p>
                     </button>
@@ -381,6 +473,135 @@ export function BrowserSidebar() {
           </section>
         </div>
       </Panel>
+
+      {sampleContextMenu && contextSample && (
+        <div
+          className="fixed z-50 w-52 rounded-md border border-slate-700 bg-slate-950/95 p-1 shadow-2xl"
+          style={{ left: sampleContextMenu.x, top: sampleContextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              void analyzeKeyForSample(contextSample.id)
+              setSampleContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800"
+          >
+            Analyze Key
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setManualKeyModal({
+                sampleId: contextSample.id,
+                key: contextSample.normalizedKey ?? 'C Minor',
+              })
+              setSampleContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800"
+          >
+            Set Key Manually
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void markSampleKeyUnknown(contextSample.id)
+              setSampleContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800"
+          >
+            Mark Key Unknown
+          </button>
+          <button
+            type="button"
+            disabled={!contextSample.normalizedKey}
+            onClick={() => {
+              setSampleAsProjectKey(contextSample.id)
+              setSampleContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800 disabled:opacity-40"
+          >
+            Use This Key as Project Key
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void toggleSampleExcludedInAutoFill(contextSample.id, !contextSample.excluded)
+              setSampleContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800"
+          >
+            {contextSample.excluded ? 'Include In Current Auto Fill' : 'Exclude From Current Auto Fill'}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              showSampleMetadata(contextSample.id)
+              setSampleContextMenu(null)
+            }}
+            className="w-full rounded px-2 py-1 text-left text-xs text-slate-200 transition hover:bg-slate-800"
+          >
+            Show Metadata
+          </button>
+          <button
+            type="button"
+            disabled
+            title="Coming later: non-destructive pitch shifting / rendered tuned copy."
+            className="w-full cursor-not-allowed rounded px-2 py-1 text-left text-xs text-slate-500"
+          >
+            Transpose / Change Key to Project Key
+          </button>
+        </div>
+      )}
+
+      {manualKeyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-950 p-3">
+            <h4 className="text-sm font-semibold text-slate-100">Set Manual Key</h4>
+            <p className="mt-1 text-xs text-slate-400">Metadata override only. Audio is not transposed.</p>
+            <select
+              value={manualKeyModal.key}
+              onChange={(event) =>
+                setManualKeyModal((current) =>
+                  current
+                    ? {
+                        ...current,
+                        key: event.target.value,
+                      }
+                    : current,
+                )
+              }
+              className="mt-3 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 outline-none"
+            >
+              {ALL_MUSICAL_KEYS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setManualKeyModal(null)}
+                className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void setSampleManualKey(manualKeyModal.sampleId, manualKeyModal.key)
+                  setManualKeyModal(null)
+                }}
+                className="rounded border border-sky-500/40 bg-sky-500/15 px-2 py-1 text-xs text-sky-200"
+              >
+                Save Key
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {folderBrowserOpen && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/80 p-6 backdrop-blur-sm">

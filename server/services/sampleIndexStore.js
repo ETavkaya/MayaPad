@@ -73,6 +73,10 @@ export async function persistSampleIndex(scanResult) {
   return latestScan
 }
 
+export async function replaceLatestSampleIndex(scanResult) {
+  return persistSampleIndex(scanResult)
+}
+
 export function getSampleById(sampleId) {
   return samplesById.get(sampleId) ?? null
 }

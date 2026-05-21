@@ -8,6 +8,7 @@ import type {
 import { getSampleStreamUrl } from './api'
 
 const LOOKAHEAD_SECONDS = 0.18
+const SCHEDULER_INTERVAL_MS = 25
 const MIN_START_DELAY_SECONDS = 0.02
 const COMMON_BEAT_LENGTHS = [1, 2, 4, 8, 16, 32, 64]
 
@@ -118,7 +119,7 @@ interface QueueStartEvent {
   trackIndex: number
   boundaryTime: number
   filename: string | null
-  preparedPromise: Promise<PreparedClip>
+  prepared: PreparedClip
   dispatched: boolean
 }
 
@@ -207,6 +208,8 @@ function normalizePlaybackRate(value: number) {
 class AudioTransport {
   private audioContext: AudioContext | null = null
   private masterGain: GainNode | null = null
+  private trackGains = new Map<number, GainNode>()
+  private desiredTrackGains = new Map<number, number>()
   private transportSettings: Pick<TransportState, 'tempo' | 'timeSignature' | 'quantize'> = {
     tempo: 120,
     timeSignature: '4/4',
@@ -214,9 +217,11 @@ class AudioTransport {
   }
   private transportStartedAt = 0
   private isPlaying = false
-  private rafId: number | null = null
+  private clockRafId: number | null = null
+  private schedulerIntervalId: number | null = null
   private listeners = new Set<(event: TransportEvent) => void>()
   private decodeCache = new Map<string, Promise<AudioBuffer>>()
+  private decodedBuffers = new Map<string, AudioBuffer>()
   private activeVoices = new Map<string, ActiveVoice>()
   private activeClipByTrack = new Map<number, string>()
   private queueEvents: QueueEvent[] = []
@@ -275,6 +280,16 @@ class AudioTransport {
     this.stopAllVoicesNow()
   }
 
+  setTrackMix(trackStates: Array<{ trackIndex: number; muted: boolean; solo: boolean; volume: number }>) {
+    const anySolo = trackStates.some((track) => track.solo)
+
+    for (const track of trackStates) {
+      const effectiveGain = track.muted ? 0 : anySolo ? (track.solo ? track.volume : 0) : track.volume
+      this.desiredTrackGains.set(track.trackIndex, effectiveGain)
+      this.applyTrackGain(track.trackIndex, effectiveGain)
+    }
+  }
+
   getClockSnapshot(): ClockSnapshot {
     const context = this.audioContext
     const now = context ? context.currentTime : 0
@@ -321,6 +336,10 @@ class AudioTransport {
       nextBoundaryTime: context ? this.getNextBoundaryTime() : null,
       queuedEventsCount: this.queueEvents.length,
       playingClipsCount: this.activeVoices.size,
+      loadingClipsCount: 0,
+      readyClipsCount: 0,
+      failedClipsCount: 0,
+      lastScheduleError: null,
     }
   }
 
@@ -356,6 +375,10 @@ class AudioTransport {
     }
 
     const targetTime = boundaryTime ?? this.getNextBoundaryTime()
+    const prepared = this.getPreparedClipFromDecodedBuffer(clip)
+    if (!prepared) {
+      throw new Error('Clip is not prepared yet.')
+    }
 
     this.queueEvents = this.queueEvents.filter((event) => {
       if (event.trackIndex !== clip.trackIndex) {
@@ -372,7 +395,7 @@ class AudioTransport {
       trackIndex: clip.trackIndex,
       boundaryTime: targetTime,
       filename: clip.filename,
-      preparedPromise: this.prepareClip(clip),
+      prepared,
       dispatched: false,
     }
 
@@ -472,6 +495,37 @@ class AudioTransport {
     return this.audioContext
   }
 
+  private getTrackGainNode(trackIndex: number) {
+    const context = this.audioContext
+    if (!context) {
+      return null
+    }
+
+    const existing = this.trackGains.get(trackIndex)
+    if (existing) {
+      return existing
+    }
+
+    const gain = context.createGain()
+    gain.gain.value = this.desiredTrackGains.get(trackIndex) ?? 1
+    gain.connect(this.masterGain ?? context.destination)
+    this.trackGains.set(trackIndex, gain)
+    return gain
+  }
+
+  private applyTrackGain(trackIndex: number, value: number) {
+    const node = this.getTrackGainNode(trackIndex)
+    const context = this.audioContext
+    if (!node || !context) {
+      return
+    }
+
+    const now = context.currentTime
+    node.gain.cancelScheduledValues(now)
+    node.gain.setValueAtTime(node.gain.value, now)
+    node.gain.linearRampToValueAtTime(value, now + 0.012)
+  }
+
   private getCurrentBeatRaw(nowSeconds: number) {
     if (!this.isPlaying || !this.audioContext) {
       return 0
@@ -482,18 +536,26 @@ class AudioTransport {
   }
 
   private startLoop() {
-    if (this.rafId !== null) {
+    if (this.schedulerIntervalId === null) {
+      this.schedulerIntervalId = window.setInterval(() => {
+        try {
+          this.processAudioTimeline()
+        } catch (error) {
+          console.debug('LaunchBrain transport timeline error', error)
+        }
+
+        if (!this.isPlaying && this.activeVoices.size === 0 && this.queueEvents.length === 0 && this.pendingStateEvents.length === 0) {
+          this.cancelLoop()
+        }
+      }, SCHEDULER_INTERVAL_MS)
+    }
+
+    if (this.clockRafId !== null) {
       return
     }
 
     const tick = () => {
-      this.rafId = requestAnimationFrame(tick)
-      try {
-        this.processAudioTimeline()
-      } catch (error) {
-        console.debug('LaunchBrain transport timeline error', error)
-      }
-
+      this.clockRafId = requestAnimationFrame(tick)
       try {
         this.publishClock()
       } catch (error) {
@@ -505,13 +567,18 @@ class AudioTransport {
       }
     }
 
-    this.rafId = requestAnimationFrame(tick)
+    this.clockRafId = requestAnimationFrame(tick)
   }
 
   private cancelLoop() {
-    if (this.rafId !== null) {
-      cancelAnimationFrame(this.rafId)
-      this.rafId = null
+    if (this.clockRafId !== null) {
+      cancelAnimationFrame(this.clockRafId)
+      this.clockRafId = null
+    }
+
+    if (this.schedulerIntervalId !== null) {
+      window.clearInterval(this.schedulerIntervalId)
+      this.schedulerIntervalId = null
     }
   }
 
@@ -536,7 +603,7 @@ class AudioTransport {
           continue
         }
 
-        void this.processStartEvent(event)
+        this.processStartEvent(event)
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unable to process transport event'
         this.emit({
@@ -610,7 +677,7 @@ class AudioTransport {
     })
   }
 
-  private async processStartEvent(event: QueueStartEvent) {
+  private processStartEvent(event: QueueStartEvent) {
     const context = this.audioContext
     if (!context) {
       return
@@ -630,7 +697,7 @@ class AudioTransport {
     }
 
     try {
-      const prepared = await event.preparedPromise
+      const prepared = event.prepared
       const boundaryTime = Math.max(event.boundaryTime, context.currentTime + MIN_START_DELAY_SECONDS)
 
       if (prepared.clip.type === 'one-shot') {
@@ -641,7 +708,7 @@ class AudioTransport {
         const gain = context.createGain()
         gain.gain.setValueAtTime(1, boundaryTime)
 
-        source.connect(gain).connect(this.masterGain ?? context.destination)
+        source.connect(gain).connect(this.getTrackGainNode(event.trackIndex) ?? this.masterGain ?? context.destination)
 
         const duration = prepared.buffer.duration / prepared.sync.playbackRate
         const stopTime = boundaryTime + duration
@@ -772,7 +839,7 @@ class AudioTransport {
       gain.gain.setValueAtTime(1, Math.max(segmentStart + fade, segmentEnd - fade))
       gain.gain.linearRampToValueAtTime(0, segmentEnd)
 
-      source.connect(gain).connect(this.masterGain ?? context.destination)
+      source.connect(gain).connect(this.getTrackGainNode(voice.trackIndex) ?? this.masterGain ?? context.destination)
       source.start(segmentStart)
       source.stop(segmentEnd + 0.001)
 
@@ -844,7 +911,10 @@ class AudioTransport {
   private async prepareClip(clip: TransportClipRequest): Promise<PreparedClip> {
     const context = await this.ensureAudioContext()
     const buffer = await this.decodeSampleBuffer(context, clip.sampleId)
+    return this.buildPreparedClip(clip, buffer)
+  }
 
+  private buildPreparedClip(clip: TransportClipRequest, buffer: AudioBuffer): PreparedClip {
     const durationSeconds = buffer.duration
     const detectedBpm = clip.detectedBpm ?? clip.bpm ?? null
     const bpmSource = detectedBpm !== null ? clip.bpmSource : 'unknown'
@@ -897,7 +967,21 @@ class AudioTransport {
     }
   }
 
+  private getPreparedClipFromDecodedBuffer(clip: TransportClipRequest): PreparedClip | null {
+    const buffer = this.decodedBuffers.get(clip.sampleId)
+    if (!buffer) {
+      return null
+    }
+
+    return this.buildPreparedClip(clip, buffer)
+  }
+
   private decodeSampleBuffer(context: AudioContext, sampleId: string) {
+    const decoded = this.decodedBuffers.get(sampleId)
+    if (decoded) {
+      return Promise.resolve(decoded)
+    }
+
     const cached = this.decodeCache.get(sampleId)
     if (cached) {
       return cached
@@ -912,8 +996,13 @@ class AudioTransport {
         return response.arrayBuffer()
       })
       .then((arrayBuffer) => context.decodeAudioData(arrayBuffer.slice(0)))
+      .then((buffer) => {
+        this.decodedBuffers.set(sampleId, buffer)
+        return buffer
+      })
       .catch((error) => {
         this.decodeCache.delete(sampleId)
+        this.decodedBuffers.delete(sampleId)
         throw error
       })
 

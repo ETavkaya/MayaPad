@@ -4,8 +4,11 @@ import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { ensureConfigFile } from './services/configStore.js'
+import { ensureFolderTagsFile } from './services/folderTagsStore.js'
 import { initializeSampleIndex } from './services/sampleIndexStore.js'
 import { ensureOverrideFile } from './services/overridesStore.js'
+import { pingDatabase } from './services/db.js'
+import { ensureSemanticSchema } from './services/semanticSchema.js'
 import { configRouter } from './routes/configRoutes.js'
 import { sampleRouter } from './routes/sampleRoutes.js'
 import { deviceRouter } from './routes/deviceRoutes.js'
@@ -58,11 +61,31 @@ const PORT = Number(process.env.PORT ?? 8010)
 
 async function start() {
   await ensureConfigFile()
+  await ensureFolderTagsFile()
   await ensureOverrideFile()
   await initializeSampleIndex()
+  const schemaStatus = await ensureSemanticSchema().catch((error) => ({
+    enabled: true,
+    migrated: false,
+    message: `PostgreSQL schema bootstrap failed: ${error instanceof Error ? error.message : 'Unknown error.'}`,
+  }))
+  const dbStatus = await pingDatabase()
 
   app.listen(PORT, () => {
     console.log(`LaunchBrain backend listening on http://localhost:${PORT}`)
+    if (schemaStatus.enabled) {
+      console.log(schemaStatus.message)
+    } else {
+      console.log('PostgreSQL semantic index disabled. Falling back to JSON index cache.')
+    }
+
+    if (dbStatus.available) {
+      console.log(
+        dbStatus.connected
+          ? 'PostgreSQL connection established.'
+          : `PostgreSQL connection failed; continuing without DB index. ${dbStatus.error ?? ''}`.trim(),
+      )
+    }
   })
 }
 

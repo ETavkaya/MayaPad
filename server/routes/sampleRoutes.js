@@ -4,7 +4,7 @@ import { stat } from 'node:fs/promises'
 import path from 'node:path'
 import { readConfig, updateConfig } from '../services/configStore.js'
 import { persistSampleIndex, getLatestSampleIndex, getSampleById } from '../services/sampleIndexStore.js'
-import { scanSampleLibrary } from '../services/sampleScanner.js'
+import { getSemanticIndexedSnapshot, scanSampleLibrary } from '../services/sampleScanner.js'
 import { applyOverridesToSamples, getSampleOverrides } from '../services/overridesStore.js'
 
 export const sampleRouter = Router()
@@ -29,20 +29,26 @@ function getContentType(filePath) {
   }
 }
 
-sampleRouter.get('/samples/index', async (_req, res) => {
-  const latestIndex = getLatestSampleIndex()
-  if (!latestIndex) {
-    return res.json(null)
+sampleRouter.get('/samples/index', async (_req, res, next) => {
+  try {
+    const config = await readConfig()
+    const semanticSnapshot = config.sampleRoot ? await getSemanticIndexedSnapshot(config.sampleRoot) : null
+    const latestIndex = semanticSnapshot ?? getLatestSampleIndex()
+    if (!latestIndex) {
+      return res.json(null)
+    }
+
+    const overrides = await getSampleOverrides().catch(() => ({}))
+    const samples = applyOverridesToSamples(latestIndex.samples ?? [], overrides)
+
+    return res.json({
+      ...latestIndex,
+      sampleCount: samples.length,
+      samples,
+    })
+  } catch (error) {
+    next(error)
   }
-
-  const overrides = await getSampleOverrides().catch(() => ({}))
-  const samples = applyOverridesToSamples(latestIndex.samples ?? [], overrides)
-
-  return res.json({
-    ...latestIndex,
-    sampleCount: samples.length,
-    samples,
-  })
 })
 
 sampleRouter.get('/samples/scan', async (_req, res, next) => {

@@ -1,18 +1,33 @@
 ﻿version: '3.9'
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - '5432:5432'
+    environment:
+      - POSTGRES_DB=launchbrain
+      - POSTGRES_USER=launchbrain
+      - POSTGRES_PASSWORD=launchbrain
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   backend:
     build:
       context: .
       dockerfile: Dockerfile.server
     ports:
       - '8010:8010'
+    depends_on:
+      - postgres
     volumes:
       - ./:/app
       - backend_node_modules:/app/node_modules
       - 'D:/Samples:/sample-library:ro'
     environment:
       - PORT=8010
+      - DATABASE_URL=postgresql://launchbrain:launchbrain@postgres:5432/launchbrain
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
 
   frontend:
     build:
@@ -30,5 +45,6 @@ services:
       - CHOKIDAR_USEPOLLING=true
 
 volumes:
+  postgres_data:
   backend_node_modules:
   frontend_node_modules:

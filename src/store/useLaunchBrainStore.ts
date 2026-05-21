@@ -41,6 +41,7 @@ import type {
   AssistantMessage,
   AutoFillSettings,
   BrowserCategory,
+  ClipPreparationState,
   ClipSlot,
   DeviceSnapshot,
   FsFolderEntry,
@@ -118,6 +119,7 @@ interface LaunchBrainState {
   clockQuantizeBeats: number
   queuedSceneLabel: string | null
   autoFillCoverageLabel: string
+  clipPreparationStatus: string | null
   currentSessionId: string | null
   currentSessionName: string
   lastSavedAt: string | null
@@ -132,6 +134,7 @@ interface LaunchBrainState {
   selectedRecentSessionId: string | null
   sampleOverrides: Record<string, SampleOverrideRecord>
   transportDiagnostics: TransportDiagnostics
+  lastScheduleError: string | null
   initializeApp: () => Promise<void>
   refreshSavedSessions: () => Promise<void>
   saveCurrentSession: (saveAs?: boolean, nameOverride?: string | null) => Promise<void>
@@ -181,7 +184,7 @@ interface LaunchBrainState {
   moveTrackColumnLeft: (trackIndex: number) => void
   moveTrackColumnRight: (trackIndex: number) => void
   resetTrackOrder: () => void
-  autoFillGrid: () => void
+  autoFillGrid: () => Promise<void>
   selectClip: (clipId: string) => void
   toggleClipPlayback: (clipId: string) => Promise<void>
   launchScene: (sceneIndex: number) => Promise<void>
@@ -189,7 +192,7 @@ interface LaunchBrainState {
   toggleTrackArm: (trackId: string) => void
   toggleTrackMute: (trackId: string) => void
   toggleTrackSolo: (trackId: string) => void
-  stopTrack: (trackIndex: number) => void
+  stopTrack: (trackId: string) => void
   setInspectorTab: (tab: InspectorTab) => void
   openInspectorTab: (tab: InspectorTab) => void
   toggleInspector: () => void
@@ -214,6 +217,13 @@ const LOOP_CONFIDENCE_WEIGHT = {
   low: 1,
 }
 
+const SESSION_SUITABILITY_WEIGHT = {
+  high: 5,
+  medium: 2,
+  low: -3,
+  ignore: -12,
+}
+
 const DEFAULT_AUTO_FILL_SETTINGS: AutoFillSettings = {
   sourceScope: 'autoBestPack',
   targetBpm: null,
@@ -222,16 +232,38 @@ const DEFAULT_AUTO_FILL_SETTINGS: AutoFillSettings = {
   keyStrictness: 'compatible',
   allowUnknownKeySamples: true,
   allowKeyNeutralStrict: true,
+  allowDuplicates: false,
+  preloadGridClips: false,
   preferLoops: true,
   allowOneShotsInFXOnly: true,
   preferSameFolder: true,
 }
 
-const IMMEDIATE_STOP_MESSAGE = 'Clip stopped: all clips'
+const IMMEDIATE_STOP_MESSAGE = 'Stopped: all clips'
+const CLIP_PRELOAD_CONCURRENCY = 4
+const DRUM_ROLE_HINTS = ['drumloop', 'drum loop', 'beat', 'groove', 'full drum', 'drums', 'kick loop', 'breakbeat']
+const DRUM2_ROLE_HINTS = [
+  'hat loop',
+  'hats',
+  'top loop',
+  'shaker',
+  'perc loop',
+  'percussion',
+  'snare loop',
+  'clap loop',
+  'ride loop',
+  'crash loop',
+]
+const FX_ROLE_HINTS = ['fx', 'riser', 'impact', 'sweep', 'downer', 'reverse', 'transition', 'noise', 'atmosphere']
+const HARMONIC_ROLE_HINTS = ['bass', 'chord', 'pad', 'melody', 'lead', 'guitar', 'vocal', 'vox', 'voice', 'piano', 'synth']
 
 let previewAudio: HTMLAudioElement | null = null
 let previewSampleId: string | null = null
 let unsubscribeAudioTransport: (() => void) | null = null
+let clipPreloadActiveCount = 0
+let clipPreloadQueue: Array<{ clipId: string; sampleId: string }> = []
+const clipPreloadQueuedKeys = new Set<string>()
+const pendingTrackLaunches = new Map<number, { clipId: string; sceneLabel: string | null }>()
 
 function defaultConfig(): AppConfig {
   return {
@@ -247,8 +279,77 @@ function getSamplePack(sample: SampleRecord): string {
   return pack && pack.length > 0 ? pack : 'Root'
 }
 
+function getSampleFamilyKey(sample: SampleRecord) {
+  const stem = sample.filename.replace(/\.[^.]+$/, '').toLowerCase()
+  const normalized = stem
+    .replace(/\b\d{2,3}\s?bpm\b/g, ' ')
+    .replace(/\b(?:[a-g](?:#|b)?)(?:\s?(?:major|minor|maj|min|m))\b/gi, ' ')
+    .replace(/\b(?:loop|loops|one shot|oneshot|shot|take|mix|version|v\d+)\b/gi, ' ')
+    .replace(/[_\-()[\]]+/g, ' ')
+    .replace(/\b\d+\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const tokens = normalized.split(' ').filter((token) => token.length > 2)
+  const base = tokens.slice(0, 4).join(' ')
+
+  return `${getSamplePack(sample)}::${base || stem}`
+}
+
 function getTrackLabel(tracks: Track[], trackIndex: number) {
   return tracks[trackIndex]?.label ?? `Track ${trackIndex + 1}`
+}
+
+function setPendingTrackLaunch(trackIndex: number, clipId: string, sceneLabel: string | null = null) {
+  pendingTrackLaunches.set(trackIndex, { clipId, sceneLabel })
+}
+
+function clearPendingTrackLaunch(trackIndex: number, clipId?: string) {
+  const pending = pendingTrackLaunches.get(trackIndex)
+  if (!pending) {
+    return
+  }
+
+  if (!clipId || pending.clipId === clipId) {
+    pendingTrackLaunches.delete(trackIndex)
+  }
+}
+
+function clearAllPendingTrackLaunches() {
+  pendingTrackLaunches.clear()
+}
+
+function syncTrackMixState(tracks: Track[]) {
+  audioTransport.setTrackMix(
+    tracks.map((track) => ({
+      trackIndex: track.index,
+      muted: track.muted,
+      solo: track.solo,
+      volume: track.volume,
+    })),
+  )
+}
+
+function truncateStatusLabel(value: string | null | undefined, maxLength = 28) {
+  if (!value) {
+    return 'Clip'
+  }
+
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value
+}
+
+function normalizeForRoleMatch(value: string) {
+  return ` ${value.toLowerCase().replace(/[^a-z0-9#b]+/g, ' ').trim()} `
+}
+
+function includesRoleHint(text: string, hints: string[]) {
+  return hints.some((hint) => text.includes(` ${hint} `) || text.includes(hint))
+}
+
+function getSampleRoleMatchText(sample: SampleRecord) {
+  return normalizeForRoleMatch(
+    `${sample.filename} ${sample.relativePath} ${sample.tags.join(' ')} ${sample.category}`,
+  )
 }
 
 function getRoleOrderFromTracks(tracks: Track[]) {
@@ -347,6 +448,9 @@ function buildTracksFromRoleOrderWithState(currentTracks: Track[], roleOrder: Tr
       muted: existing?.muted ?? false,
       solo: existing?.solo ?? false,
       selected: role === selectedRole,
+      volume: existing?.volume ?? 1,
+      playingClipId: existing?.playingClipId ?? null,
+      queuedClipId: existing?.queuedClipId ?? null,
     }
   })
 }
@@ -378,6 +482,8 @@ function remapClipsForRoleOrder(
             sampleId: null,
             clipName: null,
             category: null,
+            categoryConfidence: 'low',
+            categorySource: 'unknown',
             type: null,
             bpm: null,
             key: null,
@@ -395,6 +501,8 @@ function remapClipsForRoleOrder(
             beatsLength: null,
             syncStatus: 'unsupported',
             playbackRate: null,
+            preparationState: 'unloaded',
+            preparationError: null,
             color: null,
             playing: false,
             launchState: 'empty',
@@ -573,6 +681,8 @@ function applySampleToClip(clip: ClipSlot, sample: SampleRecord, trackColor: str
     sampleId: sample.id,
     clipName: sample.filename,
     category: sample.category,
+    categoryConfidence: sample.categoryConfidence,
+    categorySource: sample.categorySource,
     type: sample.type,
     bpm: sample.bpm,
     detectedBpm: sample.detectedBpm ?? sample.bpm,
@@ -590,6 +700,16 @@ function applySampleToClip(clip: ClipSlot, sample: SampleRecord, trackColor: str
     beatsLength: sample.beatsLength ?? null,
     syncStatus: sample.syncStatus ?? 'unsupported',
     playbackRate: sample.playbackRate ?? null,
+    subtype: sample.subtype ?? null,
+    role: sample.role ?? null,
+    sessionSuitability: sample.sessionSuitability ?? 'low',
+    semanticTags: sample.semanticTags ?? [],
+    moodTags: sample.moodTags ?? [],
+    instrumentationTags: sample.instrumentationTags ?? [],
+    sourceContext: sample.sourceContext ?? null,
+    classificationReason: sample.classificationReason ?? null,
+    preparationState: 'unloaded',
+    preparationError: null,
     color: trackColor,
     playing: false,
     launchState: 'stopped',
@@ -604,6 +724,8 @@ function emptyClip(clip: ClipSlot): ClipSlot {
     sampleId: null,
     clipName: null,
     category: null,
+    categoryConfidence: 'low',
+    categorySource: 'unknown',
     type: null,
     bpm: null,
     key: null,
@@ -621,6 +743,16 @@ function emptyClip(clip: ClipSlot): ClipSlot {
     beatsLength: null,
     syncStatus: 'unsupported',
     playbackRate: null,
+    subtype: null,
+    role: null,
+    sessionSuitability: 'low',
+    semanticTags: [],
+    moodTags: [],
+    instrumentationTags: [],
+    sourceContext: null,
+    classificationReason: null,
+    preparationState: 'unloaded',
+    preparationError: null,
     color: null,
     playing: false,
     launchState: 'empty',
@@ -654,31 +786,109 @@ function isLoopLike(type: SampleType) {
   return type !== 'one-shot'
 }
 
-function getCategoryTargets(track: Track): string[] {
-  return track.acceptedCategories
-}
-
 function isKeyNeutralTrack(track: Track) {
   return track.keyNeutral || track.role === 'drum' || track.role === 'drum2_hats' || track.role === 'fx'
 }
 
-function computePackCoverage(samples: SampleRecord[], tracks: Track[]) {
-  const coverageByPack = new Map<string, Set<string>>()
+function isMediumOrHighCategory(sample: SampleRecord) {
+  return sample.categoryConfidence === 'high' || sample.categoryConfidence === 'medium'
+}
 
-  for (const sample of samples) {
-    const pack = getSamplePack(sample)
-    if (!coverageByPack.has(pack)) {
-      coverageByPack.set(pack, new Set())
-    }
+function isRoleCategoryMatch(sample: SampleRecord, track: Track) {
+  const roleText = getSampleRoleMatchText(sample)
+  const hasHarmonicHints = includesRoleHint(roleText, HARMONIC_ROLE_HINTS)
 
-    const set = coverageByPack.get(pack)
-    if (!set) {
+  switch (track.role) {
+    case 'drum':
+      return (
+        sample.category === 'Drums' &&
+        isMediumOrHighCategory(sample) &&
+        isLoopLike(sample.type) &&
+        includesRoleHint(roleText, DRUM_ROLE_HINTS) &&
+        !includesRoleHint(roleText, FX_ROLE_HINTS) &&
+        !hasHarmonicHints
+      )
+    case 'drum2_hats':
+      return (
+        (sample.category === 'Hats / Perc' || sample.category === 'Drums') &&
+        isMediumOrHighCategory(sample) &&
+        isLoopLike(sample.type) &&
+        includesRoleHint(roleText, DRUM2_ROLE_HINTS) &&
+        !includesRoleHint(roleText, FX_ROLE_HINTS) &&
+        !hasHarmonicHints
+      )
+    case 'fx':
+      return sample.category === 'FX' && isMediumOrHighCategory(sample) && includesRoleHint(roleText, FX_ROLE_HINTS)
+    default:
+      if (sample.role && sample.role !== track.role) {
+        return false
+      }
+      return track.acceptedCategories.includes(sample.category) && isMediumOrHighCategory(sample)
+  }
+}
+
+function summarizeClipPreparationCounts(clips: ClipSlot[]) {
+  let unloaded = 0
+  let loading = 0
+  let ready = 0
+  let failed = 0
+
+  for (const clip of clips) {
+    if (!clip.filled) {
       continue
     }
 
+    if (clip.preparationState === 'unloaded') {
+      unloaded += 1
+    } else
+    if (clip.preparationState === 'loading') {
+      loading += 1
+    } else if (clip.preparationState === 'ready') {
+      ready += 1
+    } else if (clip.preparationState === 'failed') {
+      failed += 1
+    }
+  }
+
+  return {
+    unloaded,
+    loading,
+    ready,
+    failed,
+    total: unloaded + loading + ready + failed,
+  }
+}
+
+function computePackCoverage(samples: SampleRecord[], tracks: Track[]) {
+  const statsByPack = new Map<string, { roles: Set<string>; usableLoops: number; bpmCounts: Map<number, number> }>()
+
+  for (const sample of samples) {
+    const pack = getSamplePack(sample)
+    if (!statsByPack.has(pack)) {
+      statsByPack.set(pack, {
+        roles: new Set(),
+        usableLoops: 0,
+        bpmCounts: new Map(),
+      })
+    }
+
+    const stats = statsByPack.get(pack)
+    if (!stats) {
+      continue
+    }
+
+    if (isLoopLike(sample.type) && isMediumOrHighCategory(sample)) {
+      stats.usableLoops += 1
+    }
+
+    const bpmValue = sample.detectedBpm ?? sample.bpm
+    if (bpmValue !== null) {
+      stats.bpmCounts.set(bpmValue, (stats.bpmCounts.get(bpmValue) ?? 0) + 1)
+    }
+
     for (const track of tracks) {
-      if (track.acceptedCategories.includes(sample.category)) {
-        set.add(track.role)
+      if (isRoleCategoryMatch(sample, track)) {
+        stats.roles.add(track.role)
       }
     }
   }
@@ -686,8 +896,9 @@ function computePackCoverage(samples: SampleRecord[], tracks: Track[]) {
   let bestPack: string | null = null
   let bestScore = -1
 
-  for (const [pack, categories] of coverageByPack.entries()) {
-    const score = categories.size
+  for (const [pack, stats] of statsByPack.entries()) {
+    const bpmConsistency = Math.max(0, ...stats.bpmCounts.values())
+    const score = stats.roles.size * 100 + stats.usableLoops * 3 + bpmConsistency * 2
     if (score > bestScore) {
       bestPack = pack
       bestScore = score
@@ -704,23 +915,34 @@ function scoreSampleCandidate(
   targetBpm: number | null,
   targetKey: string | null,
   settings: AutoFillSettings,
+  usedRelativePaths: Set<string>,
+  usedSampleFamilies: Set<string>,
 ) {
-  if (sample.excluded) {
+  if (sample.excluded || sample.ignored || sample.sessionSuitability === 'ignore') {
+    return Number.NEGATIVE_INFINITY
+  }
+
+  if (!settings.allowDuplicates && usedRelativePaths.has(sample.relativePath)) {
+    return Number.NEGATIVE_INFINITY
+  }
+
+  const sampleFamilyKey = getSampleFamilyKey(sample)
+  if (!settings.allowDuplicates && usedSampleFamilies.has(sampleFamilyKey)) {
+    return Number.NEGATIVE_INFINITY
+  }
+
+  if (!isRoleCategoryMatch(sample, track)) {
     return Number.NEGATIVE_INFINITY
   }
 
   let score = 0
-  const categoryTargets = getCategoryTargets(track)
   const samplePack = getSamplePack(sample)
   const isFxTrack = track.role === 'fx'
   const allowKeyNeutralStrict = settings.allowKeyNeutralStrict && isKeyNeutralTrack(track)
+  score += 42
 
-  if (categoryTargets.includes(sample.category)) {
-    score += 42
-  } else if (sample.category === 'Uncategorized') {
-    score += 2
-  } else {
-    score -= 22
+  if (sample.role && sample.role === track.role) {
+    score += 18
   }
 
   if (preferredPack && samplePack === preferredPack) {
@@ -783,18 +1005,18 @@ function scoreSampleCandidate(
   }
 
   if ((settings.allowOneShotsInFXOnly || !track.allowOneShots) && !isFxTrack && sample.type === 'one-shot') {
-    score -= 35
+    return Number.NEGATIVE_INFINITY
   }
 
   score += (LOOP_CONFIDENCE_WEIGHT[sample.loopConfidence] ?? 0) * 2
+  score += SESSION_SUITABILITY_WEIGHT[sample.sessionSuitability ?? 'low'] ?? 0
 
   return score
 }
 
 function getCoverageLabel(samples: SampleRecord[], tracks: Track[]) {
-  const categories = new Set(samples.map((sample) => sample.category))
   const matchedRoles = tracks.filter((track) =>
-    track.acceptedCategories.some((category) => categories.has(category)),
+    samples.some((sample) => isRoleCategoryMatch(sample, track)),
   ).length
 
   if (matchedRoles >= Math.max(6, tracks.length - 1)) {
@@ -830,7 +1052,11 @@ function buildSessionManifestFromState(
     scale: state.transport.scale,
     autoFillSettings: state.autoFillSettings,
     layoutPresetName: state.layoutPresetName,
-    tracks: state.tracks,
+    tracks: state.tracks.map((track) => ({
+      ...track,
+      playingClipId: null,
+      queuedClipId: null,
+    })),
     clips: state.clips.map((clip) => ({
       id: clip.id,
       clipName: clip.clipName,
@@ -843,6 +1069,8 @@ function buildSessionManifestFromState(
       absolutePath: clip.absolutePath,
       relativePath: clip.relativePath,
       category: clip.category,
+      categoryConfidence: clip.categoryConfidence,
+      categorySource: clip.categorySource,
       type: clip.type,
       bpm: clip.bpm,
       key: clip.key,
@@ -858,6 +1086,14 @@ function buildSessionManifestFromState(
       beatsLength: clip.beatsLength,
       syncStatus: clip.syncStatus,
       playbackRate: clip.playbackRate,
+      subtype: clip.subtype,
+      role: clip.role,
+      sessionSuitability: clip.sessionSuitability,
+      semanticTags: clip.semanticTags,
+      moodTags: clip.moodTags,
+      instrumentationTags: clip.instrumentationTags,
+      sourceContext: clip.sourceContext,
+      classificationReason: clip.classificationReason,
       color: clip.color,
       missingFile: clip.missingFile,
     })),
@@ -893,6 +1129,8 @@ function applyLoadedSessionToClipGrid(
       sampleId: saved.sampleId ?? null,
       clipName: saved.clipName ?? null,
       category: saved.category ?? null,
+      categoryConfidence: saved.categoryConfidence ?? 'low',
+      categorySource: saved.categorySource ?? 'unknown',
       type: saved.type ?? null,
       bpm: saved.bpm ?? null,
       key: saved.key ?? null,
@@ -908,6 +1146,16 @@ function applyLoadedSessionToClipGrid(
       beatsLength: saved.beatsLength ?? null,
       syncStatus: saved.syncStatus ?? 'unsupported',
       playbackRate: saved.playbackRate ?? null,
+      subtype: saved.subtype ?? null,
+      role: saved.role ?? null,
+      sessionSuitability: saved.sessionSuitability ?? 'low',
+      semanticTags: saved.semanticTags ?? [],
+      moodTags: saved.moodTags ?? [],
+      instrumentationTags: saved.instrumentationTags ?? [],
+      sourceContext: saved.sourceContext ?? null,
+      classificationReason: saved.classificationReason ?? null,
+      preparationState: 'unloaded' as const,
+      preparationError: null,
       absolutePath: saved.absolutePath ?? null,
       relativePath: saved.relativePath ?? null,
       color: saved.color ?? tracks[clip.trackIndex]?.color ?? null,
@@ -1005,6 +1253,43 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     }
   }
 
+  const buildClipPreparationStatus = (clips: ClipSlot[]) => {
+    const counts = summarizeClipPreparationCounts(clips)
+    if (counts.total === 0) {
+      return null
+    }
+
+    if (counts.loading === 0 && counts.failed === 0 && counts.ready >= counts.total) {
+      return null
+    }
+
+    let status = `Preparing clips: ${counts.ready}/${counts.total}`
+    if (counts.loading > 0) {
+      status += `, ${counts.loading} loading`
+    }
+    if (counts.failed > 0) {
+      status += `, ${counts.failed} failed`
+    }
+
+    return status
+  }
+
+  const buildTransportDiagnosticsState = (
+    clips: ClipSlot[] = get().clips,
+    lastScheduleError: string | null = get().lastScheduleError,
+  ) => {
+    const base = audioTransport.getDiagnostics()
+    const counts = summarizeClipPreparationCounts(clips)
+
+    return {
+      ...base,
+      loadingClipsCount: counts.loading,
+      readyClipsCount: counts.ready,
+      failedClipsCount: counts.failed,
+      lastScheduleError,
+    }
+  }
+
   const ensureAudioTransportSubscription = () => {
     if (unsubscribeAudioTransport) {
       return
@@ -1012,18 +1297,18 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
     unsubscribeAudioTransport = audioTransport.subscribe((event) => {
       if (event.type === 'clock') {
-        set({
+        set(() => ({
           clockProgress: event.snapshot.progress,
           clockBeatInBar: event.snapshot.beatInBar,
           clockBeatInCycle: event.snapshot.beatInCycle,
           clockBeatsPerBar: event.snapshot.beatsPerBar,
           clockQuantizeBeats: event.snapshot.quantizeBeats,
-          transportDiagnostics: audioTransport.getDiagnostics(),
-        })
+        }))
         return
       }
 
       if (event.type === 'clip-error') {
+        clearPendingTrackLaunch(event.trackIndex, event.clipId)
         set((state) => ({
           clips: state.clips.map((clip) =>
             clip.id === event.clipId
@@ -1032,17 +1317,56 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
                   playing: false,
                   launchState: clip.filled ? 'stopped' : 'empty',
                   syncStatus: 'unsupported',
+                  preparationState: 'failed',
+                  preparationError: event.message,
                 }
               : clip,
           ),
+          tracks: state.tracks.map((track) =>
+            track.index === event.trackIndex && track.queuedClipId === event.clipId
+              ? { ...track, queuedClipId: null, playingClipId: track.playingClipId === event.clipId ? null : track.playingClipId }
+              : track.index === event.trackIndex && track.playingClipId === event.clipId
+                ? { ...track, playingClipId: null }
+                : track,
+          ),
           errorMessage: event.message,
-          lastAction: `Clip unavailable: ${event.filename ?? event.clipId}`,
-          transportDiagnostics: audioTransport.getDiagnostics(),
+          lastScheduleError: event.message,
+          lastAction: `Failed: ${truncateStatusLabel(event.filename ?? event.message)}`,
+          clipPreparationStatus: buildClipPreparationStatus(
+            state.clips.map((clip) =>
+              clip.id === event.clipId
+                ? {
+                    ...clip,
+                    playing: false,
+                    launchState: clip.filled ? 'stopped' : 'empty',
+                    syncStatus: 'unsupported',
+                    preparationState: 'failed',
+                    preparationError: event.message,
+                  }
+                : clip,
+            ),
+          ),
+          transportDiagnostics: buildTransportDiagnosticsState(
+            state.clips.map((clip) =>
+              clip.id === event.clipId
+                ? {
+                    ...clip,
+                    playing: false,
+                    launchState: clip.filled ? 'stopped' : 'empty',
+                    syncStatus: 'unsupported',
+                    preparationState: 'failed',
+                    preparationError: event.message,
+                  }
+                : clip,
+            ),
+            event.message,
+          ),
         }))
         return
       }
 
       if (event.type === 'clip-started') {
+        clearPendingTrackLaunch(event.trackIndex, event.clipId)
         set((state) => ({
           clips: state.clips.map((clip) => {
             if (clip.trackIndex !== event.trackIndex) {
@@ -1070,35 +1394,64 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
               launchState: clip.filled ? 'stopped' : 'empty',
             }
           }),
+          tracks: state.tracks.map((track) =>
+            track.index === event.trackIndex
+              ? {
+                  ...track,
+                  playingClipId: event.clipId,
+                  queuedClipId: track.queuedClipId === event.clipId ? null : track.queuedClipId,
+                }
+              : track,
+          ),
           queuedSceneLabel: null,
           playbackEngineStatus: 'Browser playback engine',
-          transportDiagnostics: audioTransport.getDiagnostics(),
+          transportDiagnostics: buildTransportDiagnosticsState(state.clips, state.lastScheduleError),
           lastAction: state.queuedSceneLabel
             ? `Scene launched: ${state.queuedSceneLabel}`
-            : `Clip started: ${event.filename ?? event.clipId}`,
+            : `Playing: ${truncateStatusLabel(event.filename ?? event.clipId)}`,
         }))
         return
       }
 
       if (event.type === 'clip-stopped') {
         set((state) => ({
-          clips: state.clips.map((clip) =>
-            clip.id === event.clipId
-              ? {
-                  ...clip,
-                  playing: false,
-                  launchState: clip.filled ? 'stopped' : 'empty',
-                }
-              : clip,
-          ),
-          transportDiagnostics: audioTransport.getDiagnostics(),
-          lastAction: event.filename ? `Clip stopped: ${event.filename}` : state.lastAction,
+          ...(() => {
+            const currentClip = state.clips.find((clip) => clip.id === event.clipId)
+            if (!currentClip || (!currentClip.playing && currentClip.launchState !== 'stopping')) {
+              return state
+            }
+
+            return {
+              clips: state.clips.map((clip) =>
+                clip.id === event.clipId
+                  ? {
+                      ...clip,
+                      playing: false,
+                      launchState: clip.filled ? 'stopped' : 'empty',
+                    }
+                  : clip,
+              ),
+              tracks: state.tracks.map((track) =>
+                track.index === event.trackIndex && track.playingClipId === event.clipId
+                  ? { ...track, playingClipId: null }
+                  : track,
+              ),
+              transportDiagnostics: buildTransportDiagnosticsState(state.clips, state.lastScheduleError),
+              lastAction:
+                state.queuedSceneLabel || state.clips.some((clip) => clip.trackIndex === event.trackIndex && clip.playing && clip.id !== event.clipId)
+                  ? state.lastAction
+                  : event.filename
+                    ? `Stopped: ${truncateStatusLabel(event.filename)}`
+                    : state.lastAction,
+            }
+          })(),
         }))
       }
     })
   }
 
   const stopTransportClock = () => {
+    clearAllPendingTrackLaunches()
     audioTransport.stopTransport()
     const beatsPerBar = getBeatsPerBar(get().transport.timeSignature)
     set({
@@ -1107,7 +1460,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       clockBeatInCycle: 1,
       clockBeatsPerBar: beatsPerBar,
       clockQuantizeBeats: Math.max(1, getQuantizeBeats(get().transport.quantize, beatsPerBar) || beatsPerBar),
-      transportDiagnostics: audioTransport.getDiagnostics(),
+      transportDiagnostics: buildTransportDiagnosticsState(get().clips, get().lastScheduleError),
     })
   }
 
@@ -1120,8 +1473,21 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     })
   }
 
+  const getBeatsUntilBoundaryText = () => {
+    const state = get()
+    if (state.transport.quantize === 'None') {
+      return 'starts immediately'
+    }
+
+    const beatsRemaining = state.transport.isPlaying
+      ? Math.max(1, state.clockQuantizeBeats - state.clockBeatInCycle + 1)
+      : Math.max(1, state.clockQuantizeBeats)
+
+    return `starts in ${beatsRemaining} beat${beatsRemaining === 1 ? '' : 's'}`
+  }
+
   const buildTransportClipRequest = (clip: ClipSlot): TransportClipRequest | null => {
-    if (!clip.filled || !clip.sampleId) {
+    if (!clip.filled || !clip.sampleId || clip.preparationState !== 'ready') {
       return null
     }
 
@@ -1144,6 +1510,33 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       beatsLength: clip.beatsLength,
       estimatedBeats: clip.estimatedBeats,
     }
+  }
+
+  const ensureClipReadyForPlayback = (clip: ClipSlot) => {
+    if (!clip.filled || !clip.sampleId) {
+      set({ lastAction: 'Playback unavailable on empty clip.' })
+      return false
+    }
+
+    if (clip.preparationState === 'ready') {
+      return true
+    }
+
+    if (clip.preparationState === 'failed') {
+      set({
+        lastAction: `Failed: ${truncateStatusLabel(clip.clipName ?? clip.id)}`,
+        lastScheduleError: clip.preparationError ?? get().lastScheduleError,
+        transportDiagnostics: buildTransportDiagnosticsState(get().clips, clip.preparationError ?? get().lastScheduleError),
+      })
+      return false
+    }
+
+    if (clip.preparationState === 'unloaded') {
+      enqueueClipPreparation(clip.id, clip.sampleId, true)
+    }
+
+    set({ lastAction: `Preparing: ${truncateStatusLabel(clip.clipName ?? clip.id)}` })
+    return false
   }
 
   const buildTransportRequestFromSample = (
@@ -1192,8 +1585,176 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     } as Partial<SampleRecord>
   }
 
+  const markClipPreparationState = (
+    clipId: string,
+    sampleId: string,
+    nextState: ClipPreparationState,
+    preparationError: string | null = null,
+    preparedPatch?: Partial<SampleRecord>,
+  ) => {
+    set((current) => {
+      const clip = current.clips.find((entry) => entry.id === clipId)
+      if (!clip || clip.sampleId !== sampleId) {
+        return current
+      }
+
+      const sourceSample = current.samples.find((entry) => entry.id === sampleId)
+      const preparedSample =
+        sourceSample && preparedPatch
+          ? ({
+              ...sourceSample,
+              ...preparedPatch,
+            } as SampleRecord)
+          : sourceSample
+
+      const nextSamples =
+        sourceSample && preparedPatch
+          ? current.samples.map((sample) => (sample.id === sampleId ? preparedSample ?? sample : sample))
+          : current.samples
+
+      const nextClips: ClipSlot[] = current.clips.map((entry) => {
+        if (entry.id !== clipId) {
+          return entry
+        }
+
+        if (preparedSample) {
+          const preparedClip = applySampleToClip(
+            entry,
+            preparedSample,
+            entry.color ?? current.tracks[entry.trackIndex]?.color ?? '#64748b',
+          )
+
+          return {
+            ...preparedClip,
+            preparationState: nextState,
+            preparationError,
+            playing: entry.playing,
+            launchState: entry.launchState,
+          }
+        }
+
+        return {
+          ...entry,
+          preparationState: nextState,
+          preparationError,
+          syncStatus: nextState === 'failed' ? 'unsupported' : entry.syncStatus,
+          playing: false,
+          launchState: entry.filled ? 'stopped' : 'empty',
+        }
+      })
+
+      return {
+        samples: nextSamples,
+        clips: nextClips,
+        clipPreparationStatus: buildClipPreparationStatus(nextClips),
+        transportDiagnostics: buildTransportDiagnosticsState(nextClips, current.lastScheduleError),
+      }
+    })
+  }
+
+  const pumpClipPreparationQueue = () => {
+    while (clipPreloadActiveCount < CLIP_PRELOAD_CONCURRENCY && clipPreloadQueue.length > 0) {
+      const nextJob = clipPreloadQueue.shift()
+      if (!nextJob) {
+        break
+      }
+
+      clipPreloadActiveCount += 1
+      const queueKey = `${nextJob.clipId}:${nextJob.sampleId}`
+
+      void (async () => {
+        const current = get()
+        const clip = current.clips.find((entry) => entry.id === nextJob.clipId)
+        const sample = current.samples.find((entry) => entry.id === nextJob.sampleId)
+        if (!clip || !sample || clip.sampleId !== sample.id || !clip.filled) {
+          return
+        }
+
+        markClipPreparationState(clip.id, sample.id, 'loading')
+
+        try {
+          const preparedPatch = await prepareSampleForGridClip(clip, sample)
+          markClipPreparationState(clip.id, sample.id, 'ready', null, preparedPatch)
+          const currentClip = get().clips.find((entry) => entry.id === clip.id)
+          if (currentClip?.launchState === 'queued') {
+            void queuePreparedClipLaunch(clip.id)
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Clip decode failed'
+          console.debug('LaunchBrain preload failed', {
+            clipId: clip.id,
+            sampleId: sample.id,
+            diagnostics: audioTransport.getDiagnostics(),
+            message,
+          })
+
+          set({
+            lastScheduleError: message,
+            errorMessage: message,
+          })
+          markClipPreparationState(clip.id, sample.id, 'failed', message)
+        }
+      })()
+        .finally(() => {
+          clipPreloadActiveCount = Math.max(0, clipPreloadActiveCount - 1)
+          clipPreloadQueuedKeys.delete(queueKey)
+          pumpClipPreparationQueue()
+        })
+    }
+  }
+
+  const enqueueClipPreparation = (clipId: string, sampleId: string, prioritize = false) => {
+    const queueKey = `${clipId}:${sampleId}`
+    if (clipPreloadQueuedKeys.has(queueKey)) {
+      return
+    }
+
+    clipPreloadQueuedKeys.add(queueKey)
+    if (prioritize) {
+      clipPreloadQueue.unshift({ clipId, sampleId })
+    } else {
+      clipPreloadQueue.push({ clipId, sampleId })
+    }
+    pumpClipPreparationQueue()
+  }
+
+  const enqueuePreparationForFilledClips = (clips: ClipSlot[]) => {
+    for (const clip of clips) {
+      if (!clip.filled || !clip.sampleId) {
+        continue
+      }
+
+      enqueueClipPreparation(clip.id, clip.sampleId)
+    }
+  }
+
+  const queuePreparedClipLaunch = async (clipId: string) => {
+    const clip = get().clips.find((entry) => entry.id === clipId)
+    if (!clip || !clip.filled || !clip.sampleId || clip.preparationState !== 'ready' || clip.playing) {
+      return
+    }
+
+    const pending = pendingTrackLaunches.get(clip.trackIndex)
+    if (!pending || pending.clipId !== clip.id) {
+      return
+    }
+
+    if (get().transport.quantize === 'None') {
+      await startClipNow(clip.id)
+      return
+    }
+
+    await ensureTransportForQueuedLaunch()
+    const boundaryTime = audioTransport.getNextBoundaryTime()
+    queueTrackSwitch(clip.trackIndex, clip.id, boundaryTime)
+    set({
+      lastAction: `Queued: ${truncateStatusLabel(clip.clipName)} - ${getBeatsUntilBoundaryText()}`,
+    })
+  }
+
   const releaseClipFromTransport = (clip: ClipSlot) => {
-    audioTransport.cancelQueuedClipStart(clip.id)
+    clearPendingTrackLaunch(clip.trackIndex, clip.id)
+    audioTransport.cancelQueuedTrackActions(clip.trackIndex)
     audioTransport.stopClipImmediately(clip.id)
 
     if (clip.playing || clip.launchState === 'stopping') {
@@ -1225,6 +1786,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
               ...optimisticClip,
               playing: false,
               launchState: 'stopped',
+              preparationState: 'loading',
+              preparationError: null,
             }
           : clip,
       )
@@ -1236,76 +1799,13 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         missingFilesCount: nextClips.filter((clip) => clip.filled && clip.missingFile).length,
         saveStatus: 'dirty',
         errorMessage: null,
-        lastAction: `Preparing ${selectedSample.filename} for clip ${selectedClip.sceneIndex + 1}.${selectedClip.trackIndex + 1}`,
+        clipPreparationStatus: buildClipPreparationStatus(nextClips),
+        transportDiagnostics: buildTransportDiagnosticsState(nextClips, current.lastScheduleError),
+        lastAction: `Preparing: ${truncateStatusLabel(selectedSample.filename)}`,
       }
     })
 
-    try {
-      const preparedPatch = await prepareSampleForGridClip(selectedClip, selectedSample)
-
-      set((current) => {
-        const currentSample = current.samples.find((sample) => sample.id === selectedSample.id) ?? selectedSample
-        const currentClip = current.clips.find((clip) => clip.id === selectedClip.id)
-        if (!currentClip || currentClip.sampleId !== selectedSample.id) {
-          return current
-        }
-
-        const preparedSample = {
-          ...currentSample,
-          ...preparedPatch,
-        }
-        const nextSamples = current.samples.map((sample) =>
-          sample.id === selectedSample.id ? preparedSample : sample,
-        )
-        const nextClips = current.clips.map((clip) =>
-          clip.id === selectedClip.id ? applySampleToClip(clip, preparedSample, trackColor) : clip,
-        )
-
-        return {
-          samples: nextSamples,
-          clips: nextClips,
-          missingFilesCount: nextClips.filter((clip) => clip.filled && clip.missingFile).length,
-          saveStatus: 'dirty',
-          lastAction: `Loaded ${selectedSample.filename} to clip ${selectedClip.sceneIndex + 1}.${selectedClip.trackIndex + 1}`,
-        }
-      })
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to prepare sample for transport'
-      console.debug('LaunchBrain clip preparation failed', {
-        clipId: selectedClip.id,
-        sampleId: selectedSample.id,
-        diagnostics: audioTransport.getDiagnostics(),
-        message,
-      })
-
-      set((current) => {
-        const currentClip = current.clips.find((clip) => clip.id === selectedClip.id)
-        if (!currentClip || currentClip.sampleId !== selectedSample.id) {
-          return current
-        }
-
-        const nextClips: ClipSlot[] = current.clips.map((clip) =>
-          clip.id === selectedClip.id
-            ? {
-                ...clip,
-                syncStatus: 'unsupported',
-                durationSeconds: clip.durationSeconds ?? null,
-                estimatedBeats: clip.estimatedBeats ?? null,
-                beatsLength: clip.beatsLength ?? null,
-                playbackRate: clip.playbackRate ?? null,
-                playing: false,
-                launchState: 'stopped',
-              }
-            : clip,
-        )
-
-        return {
-          clips: nextClips,
-          errorMessage: message,
-          lastAction: `Sample prepared with limited sync: ${selectedSample.filename}`,
-        }
-      })
-    }
+    enqueueClipPreparation(selectedClip.id, selectedSample.id, true)
   }
 
   const ensureTransportForQueuedLaunch = async () => {
@@ -1340,6 +1840,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
   const stopTrackNow = (trackIndex: number) => {
     const state = get()
+    clearPendingTrackLaunch(trackIndex)
     const targetClips = state.clips.filter((clip) => clip.trackIndex === trackIndex && clip.playing)
     for (const clip of targetClips) {
       void audioTransport.queueClipStop(
@@ -1347,16 +1848,27 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         audioTransport.getNextBoundaryTime('None'),
       )
     }
-    set({ lastAction: `Clip stopped: ${getTrackLabel(state.tracks, trackIndex)}` })
+    set((current) => ({
+      tracks: current.tracks.map((track) =>
+        track.index === trackIndex ? { ...track, queuedClipId: null } : track,
+      ),
+      lastAction: `Stopped: ${truncateStatusLabel(getTrackLabel(state.tracks, trackIndex))}`,
+    }))
   }
 
   const stopAllClipsNow = () => {
+    clearAllPendingTrackLaunches()
     audioTransport.stopAll()
     set((state) => ({
       clips: state.clips.map((clip) => ({
         ...clip,
         playing: false,
         launchState: clip.filled ? 'stopped' : 'empty',
+      })),
+      tracks: state.tracks.map((track) => ({
+        ...track,
+        playingClipId: null,
+        queuedClipId: null,
       })),
       queuedSceneLabel: null,
       lastAction: IMMEDIATE_STOP_MESSAGE,
@@ -1366,13 +1878,24 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
   const queueTrackSwitch = (trackIndex: number, startClipId: string, boundaryOverride?: number) => {
     const state = get()
     const trackLabel = getTrackLabel(state.tracks, trackIndex)
+    const beatsMessage = getBeatsUntilBoundaryText()
     const hasOtherPlaying = state.clips.some(
       (clip) => clip.trackIndex === trackIndex && clip.playing && clip.id !== startClipId,
     )
     const startClip = state.clips.find((clip) => clip.id === startClipId)
+    const isClipReady = Boolean(startClip && startClip.preparationState === 'ready')
     const stoppingClips = state.clips.filter((clip) => clip.trackIndex === trackIndex && clip.playing && clip.id !== startClipId)
+    setPendingTrackLaunch(trackIndex, startClipId, state.queuedSceneLabel)
 
     set((current) => ({
+      tracks: current.tracks.map((track) =>
+        track.index === trackIndex
+          ? {
+              ...track,
+              queuedClipId: startClipId,
+            }
+          : track,
+      ),
       clips: current.clips.map((clip) => {
         if (clip.trackIndex !== trackIndex) {
           return clip
@@ -1392,7 +1915,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           }
         }
 
-        if (clip.playing) {
+        if (clip.playing && isClipReady) {
           return {
             ...clip,
             launchState: 'stopping',
@@ -1401,10 +1924,22 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
         return clip
       }),
-      lastAction: hasOtherPlaying
-        ? `Column switched: ${trackLabel}`
-        : `Clip queued: ${startClip?.clipName ?? startClipId}`,
+      lastAction:
+        startClip && !isClipReady
+          ? `Preparing: ${truncateStatusLabel(startClip.clipName)}`
+          : hasOtherPlaying
+            ? `Queued: ${trackLabel} - ${beatsMessage}`
+            : `Queued: ${truncateStatusLabel(startClip?.clipName ?? startClipId)} - ${beatsMessage}`,
     }))
+
+    if (!startClip) {
+      return
+    }
+
+    if (!isClipReady) {
+      ensureClipReadyForPlayback(startClip)
+      return
+    }
 
     const request = startClip ? buildTransportClipRequest(startClip) : null
     if (!request) {
@@ -1414,6 +1949,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     void (async () => {
       await ensureTransportForQueuedLaunch()
       const boundaryTime = boundaryOverride ?? audioTransport.getNextBoundaryTime()
+      audioTransport.cancelQueuedTrackActions(trackIndex)
 
       for (const clip of stoppingClips) {
         await audioTransport.queueClipStop(
@@ -1435,6 +1971,10 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     const target = state.clips.find((clip) => clip.id === clipId)
     if (!target || !target.filled || !target.sampleId) {
       set({ lastAction: 'Playback unavailable on empty clip.' })
+      return
+    }
+
+    if (!ensureClipReadyForPlayback(target)) {
       return
     }
 
@@ -1574,6 +2114,9 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
   const clearClipByIdInternal = (clipId: string) => {
     const clip = get().clips.find((item) => item.id === clipId)
+    if (clip) {
+      clearPendingTrackLaunch(clip.trackIndex, clip.id)
+    }
     if (clip?.playing) {
       void audioTransport.queueClipStop(
         {
@@ -1588,6 +2131,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       const nextClips = state.clips.map((clip) => (clip.id === clipId ? emptyClip(clip) : clip))
       return {
         clips: nextClips,
+        clipPreparationStatus: buildClipPreparationStatus(nextClips),
+        transportDiagnostics: buildTransportDiagnosticsState(nextClips, state.lastScheduleError),
         missingFilesCount: nextClips.filter((clip) => clip.filled && clip.missingFile).length,
         lastClearSnapshot: createClearSnapshot(state, 'Undo clear clip'),
         canUndoClear: true,
@@ -1656,6 +2201,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     queuedSceneLabel: null,
     currentSessionId: null,
     currentSessionName: 'Untitled Set',
+    clipPreparationStatus: null,
     lastSavedAt: null,
     saveStatus: 'idle',
     missingFilesCount: 0,
@@ -1664,6 +2210,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     selectedRecentSessionId: null,
     sampleOverrides: {},
     transportDiagnostics: audioTransport.getDiagnostics(),
+    lastScheduleError: null,
     autoFillCoverageLabel: 'Partial pack',
     canUndoClear: false,
 
@@ -1695,6 +2242,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           playbackEngineStatus: 'Browser playback engine',
         })
         configureAudioTransport()
+        syncTrackMixState(get().tracks)
       } catch (error) {
         set({
           isBootstrapping: false,
@@ -1757,14 +2305,21 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         const response = await apiLoadSession(sessionId)
         const loaded = response.session
 
+        clearAllPendingTrackLaunches()
         audioTransport.stopAll()
+        clipPreloadQueue = []
+        clipPreloadQueuedKeys.clear()
 
         const state = get()
         const loadedRoleOrder = normalizeRoleOrderFromLoadedTracks((loaded.tracks as Partial<Track>[] | undefined) ?? [])
         const restoredTracks = buildTracksFromRoleOrderWithState(
           Array.isArray(loaded.tracks) && loaded.tracks.length > 0 ? (loaded.tracks as Track[]) : state.tracks,
           loadedRoleOrder,
-        )
+        ).map((track) => ({
+          ...track,
+          playingClipId: null,
+          queuedClipId: null,
+        }))
         const applied = applyLoadedSessionToClipGrid(state.clips, loaded, restoredTracks)
         const restoredPresetName =
           loaded.layoutPresetName ??
@@ -1806,6 +2361,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           saveStatus: 'saved',
           selectedRecentSessionId: loaded.id,
           missingFilesCount: applied.missingFilesCount,
+          clipPreparationStatus: buildClipPreparationStatus(applied.nextClips),
+          transportDiagnostics: buildTransportDiagnosticsState(applied.nextClips, current.lastScheduleError),
           lastClearSnapshot: null,
           canUndoClear: false,
           queuedSceneLabel: null,
@@ -1817,6 +2374,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
         stopTransportClock()
         configureAudioTransport()
+        syncTrackMixState(restoredTracks)
+        enqueuePreparationForFilledClips(applied.nextClips)
       } catch (error) {
         set({
           errorMessage: error instanceof Error ? error.message : 'Failed to load session',
@@ -2019,7 +2578,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       set((current) => ({
         transport: { ...current.transport, isPlaying: true },
         playbackEngineStatus: 'Browser playback engine',
-        transportDiagnostics: audioTransport.getDiagnostics(),
+        transportDiagnostics: buildTransportDiagnosticsState(current.clips, current.lastScheduleError),
         lastAction: 'Transport running',
       }))
     },
@@ -2027,21 +2586,30 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     setTransportStop: () => {
       stopTransportClock()
 
-      set((state) => ({
-        transport: {
-          ...state.transport,
-          isPlaying: false,
-          isRecording: false,
-        },
-        clips: state.clips.map((clip) => ({
+      set((state) => {
+        const nextClips: ClipSlot[] = state.clips.map((clip) => ({
           ...clip,
           playing: false,
-          launchState: clip.filled ? 'stopped' : 'empty',
-        })),
-        queuedSceneLabel: null,
-        transportDiagnostics: audioTransport.getDiagnostics(),
-        lastAction: 'Transport stopped: all clips',
-      }))
+          launchState: (clip.filled ? 'stopped' : 'empty') as ClipSlot['launchState'],
+        }))
+
+        return {
+          transport: {
+            ...state.transport,
+            isPlaying: false,
+            isRecording: false,
+          },
+          clips: nextClips,
+          tracks: state.tracks.map((track) => ({
+            ...track,
+            playingClipId: null,
+            queuedClipId: null,
+          })),
+          queuedSceneLabel: null,
+          transportDiagnostics: buildTransportDiagnosticsState(nextClips, state.lastScheduleError),
+          lastAction: 'Transport stopped: all clips',
+        }
+      })
     },
 
     stopAllClipPlayback: () => {
@@ -2051,10 +2619,12 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         return
       }
 
+      clearAllPendingTrackLaunches()
       const boundaryTime = audioTransport.getNextBoundaryTime()
+      for (const track of state.tracks) {
+        audioTransport.cancelQueuedTrackActions(track.index)
+      }
       for (const clip of state.clips) {
-        audioTransport.cancelQueuedClipStart(clip.id)
-
         if (!clip.playing && clip.launchState !== 'stopping') {
           continue
         }
@@ -2070,6 +2640,10 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       }
 
       set((current) => ({
+        tracks: current.tracks.map((track) => ({
+          ...track,
+          queuedClipId: null,
+        })),
         clips: current.clips.map((clip) => {
           if (clip.launchState === 'queued') {
             return {
@@ -2088,7 +2662,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
           return clip
         }),
         queuedSceneLabel: null,
-        lastAction: 'Stop All queued',
+        lastAction: 'Stop all queued',
       }))
     },
 
@@ -2503,13 +3077,29 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
     applyLayoutPreset: (presetName) => {
       const roleOrder = TRACK_LAYOUT_PRESET_ORDER[presetName]
+      clearAllPendingTrackLaunches()
       audioTransport.stopAll()
-      set((state) => ({
-        ...applyTrackRoleOrderToState(state, roleOrder, presetName),
-        queuedSceneLabel: null,
-        saveStatus: 'dirty',
-        lastAction: `Layout preset applied: ${presetName}`,
+      const nextTracks = buildTracksFromRoleOrderWithState(get().tracks, roleOrder).map((track) => ({
+        ...track,
+        playingClipId: null,
+        queuedClipId: null,
       }))
+      syncTrackMixState(nextTracks)
+      set((state) => {
+        const applied = applyTrackRoleOrderToState(
+          { ...state, tracks: nextTracks } as LaunchBrainState,
+          roleOrder,
+          presetName,
+        )
+        return {
+          ...applied,
+          clipPreparationStatus: buildClipPreparationStatus(applied.clips),
+          transportDiagnostics: buildTransportDiagnosticsState(applied.clips, state.lastScheduleError),
+          queuedSceneLabel: null,
+          saveStatus: 'dirty',
+          lastAction: `Layout preset applied: ${presetName}`,
+        }
+      })
     },
 
     moveTrackColumnLeft: (trackIndex) => {
@@ -2517,12 +3107,22 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         return
       }
 
+      clearAllPendingTrackLaunches()
       audioTransport.stopAll()
       set((state) => {
         const roleOrder = getRoleOrderFromTracks(state.tracks)
         const nextRoleOrder = moveArrayItem(roleOrder, trackIndex, trackIndex - 1)
+        const nextTracks = buildTracksFromRoleOrderWithState(state.tracks, nextRoleOrder).map((track) => ({
+          ...track,
+          playingClipId: null,
+          queuedClipId: null,
+        }))
+        syncTrackMixState(nextTracks)
+        const applied = applyTrackRoleOrderToState({ ...state, tracks: nextTracks } as LaunchBrainState, nextRoleOrder)
         return {
-          ...applyTrackRoleOrderToState(state, nextRoleOrder),
+          ...applied,
+          clipPreparationStatus: buildClipPreparationStatus(applied.clips),
+          transportDiagnostics: buildTransportDiagnosticsState(applied.clips, state.lastScheduleError),
           queuedSceneLabel: null,
           saveStatus: 'dirty',
           lastAction: `Moved column left: ${getTrackLabel(state.tracks, trackIndex)}`,
@@ -2536,12 +3136,22 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         return
       }
 
+      clearAllPendingTrackLaunches()
       audioTransport.stopAll()
       set((state) => {
         const roleOrder = getRoleOrderFromTracks(state.tracks)
         const nextRoleOrder = moveArrayItem(roleOrder, trackIndex, trackIndex + 1)
+        const nextTracks = buildTracksFromRoleOrderWithState(state.tracks, nextRoleOrder).map((track) => ({
+          ...track,
+          playingClipId: null,
+          queuedClipId: null,
+        }))
+        syncTrackMixState(nextTracks)
+        const applied = applyTrackRoleOrderToState({ ...state, tracks: nextTracks } as LaunchBrainState, nextRoleOrder)
         return {
-          ...applyTrackRoleOrderToState(state, nextRoleOrder),
+          ...applied,
+          clipPreparationStatus: buildClipPreparationStatus(applied.clips),
+          transportDiagnostics: buildTransportDiagnosticsState(applied.clips, state.lastScheduleError),
           queuedSceneLabel: null,
           saveStatus: 'dirty',
           lastAction: `Moved column right: ${getTrackLabel(state.tracks, trackIndex)}`,
@@ -2550,155 +3160,188 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     },
 
     resetTrackOrder: () => {
+      clearAllPendingTrackLaunches()
       audioTransport.stopAll()
-      set((state) => ({
-        ...applyTrackRoleOrderToState(state, [...DEFAULT_ROLE_ORDER], DEFAULT_LAYOUT_PRESET),
-        queuedSceneLabel: null,
-        saveStatus: 'dirty',
-        lastAction: 'Column order reset to Classic',
-      }))
+      set((state) => {
+        const nextTracks = buildTracksFromRoleOrderWithState(state.tracks, [...DEFAULT_ROLE_ORDER]).map((track) => ({
+          ...track,
+          playingClipId: null,
+          queuedClipId: null,
+        }))
+        syncTrackMixState(nextTracks)
+        const applied = applyTrackRoleOrderToState(
+          { ...state, tracks: nextTracks } as LaunchBrainState,
+          [...DEFAULT_ROLE_ORDER],
+          DEFAULT_LAYOUT_PRESET,
+        )
+        return {
+          ...applied,
+          clipPreparationStatus: buildClipPreparationStatus(applied.clips),
+          transportDiagnostics: buildTransportDiagnosticsState(applied.clips, state.lastScheduleError),
+          queuedSceneLabel: null,
+          saveStatus: 'dirty',
+          lastAction: 'Column order reset to Classic',
+        }
+      })
     },
 
-    autoFillGrid: () =>
-      set((state) => {
-        if (state.samples.length === 0) {
-          return { lastAction: 'Auto Fill Grid skipped: no scanned samples' }
+    autoFillGrid: async () => {
+      const state = get()
+      if (state.samples.length === 0) {
+        set({ lastAction: 'Auto Fill Grid skipped: no scanned samples' })
+        return
+      }
+
+      clearAllPendingTrackLaunches()
+      audioTransport.stopAll()
+      clipPreloadQueue = []
+      clipPreloadQueuedKeys.clear()
+
+      const settings = state.autoFillSettings
+      const source = resolveAutoFillSource(state.samples, state.tracks, state.activePack, settings.sourceScope)
+      const sourceSamples = source.sourceSamples.length > 0 ? source.sourceSamples : state.samples
+      const chosenPack = source.chosenPack
+      const coverageLabel = getCoverageLabel(sourceSamples, state.tracks)
+      const inferredBpm = settings.targetBpm ?? inferMostCommonBpm(sourceSamples)
+      const inferredKey = resolveActiveHarmonicTargetKey(
+        settings.targetKey,
+        state.activeKeyFilter,
+        state.transport,
+        sourceSamples,
+      )
+
+      const usedRelativePaths = new Set<string>()
+      const usedSampleFamilies = new Set<string>()
+      const nextClips: ClipSlot[] = []
+
+      for (const clip of state.clips) {
+        const track = state.tracks[clip.trackIndex]
+        if (!track) {
+          nextClips.push(emptyClip(clip))
+          continue
         }
 
-        audioTransport.stopAll()
+        let candidates = sourceSamples.filter((sample) => !sample.excluded && isRoleCategoryMatch(sample, track))
 
-        const settings = state.autoFillSettings
-        const source = resolveAutoFillSource(state.samples, state.tracks, state.activePack, settings.sourceScope)
-        const sourceSamples = source.sourceSamples.length > 0 ? source.sourceSamples : state.samples
-        const chosenPack = source.chosenPack
-        const coverageLabel = getCoverageLabel(sourceSamples, state.tracks)
-        const siblingSamples =
-          chosenPack !== null
-            ? state.samples.filter((sample) => getSamplePack(sample) !== chosenPack)
-            : []
-        const shouldUseSiblingFallback =
-          settings.sourceScope === 'selectedPack' &&
-          coverageLabel !== 'Full pack' &&
-          chosenPack !== null &&
-          !settings.preferSameFolder
+        if (settings.allowOneShotsInFXOnly && track.role !== 'fx') {
+          candidates = candidates.filter((sample) => sample.type !== 'one-shot')
+        }
 
-        const inferredBpm = settings.targetBpm ?? inferMostCommonBpm(sourceSamples)
-        const inferredKey = resolveActiveHarmonicTargetKey(
-          settings.targetKey,
-          state.activeKeyFilter,
-          state.transport,
-          sourceSamples,
-        )
+        if (!track.allowOneShots) {
+          candidates = candidates.filter((sample) => sample.type !== 'one-shot')
+        }
 
-        const nextClips = state.clips.map((clip) => {
-          const track = state.tracks[clip.trackIndex]
-          if (!track) {
-            return emptyClip(clip)
+        if (settings.preferLoops) {
+          const loopCandidates = candidates.filter((sample) => isLoopLike(sample.type))
+          if (loopCandidates.length > 0) {
+            candidates = loopCandidates
           }
+        }
 
-          const categoryTargets = getCategoryTargets(track)
-          const isFxTrack = track.role === 'fx'
-
-          let candidates = sourceSamples.filter(
-            (sample) => categoryTargets.includes(sample.category) && !sample.excluded,
-          )
-          if (candidates.length === 0 && shouldUseSiblingFallback) {
-            candidates = siblingSamples.filter(
-              (sample) => categoryTargets.includes(sample.category) && !sample.excluded,
-            )
-          }
-
-          if (settings.allowOneShotsInFXOnly && !isFxTrack) {
-            const withoutOneShots = candidates.filter((sample) => sample.type !== 'one-shot')
-            if (withoutOneShots.length > 0) {
-              candidates = withoutOneShots
-            }
-          }
-
-          if (!track.allowOneShots) {
-            const loopOrUnknown = candidates.filter((sample) => sample.type !== 'one-shot')
-            if (loopOrUnknown.length > 0) {
-              candidates = loopOrUnknown
-            }
-          }
-
-          if (settings.preferLoops) {
-            const loopCandidates = candidates.filter((sample) => isLoopLike(sample.type))
-            if (loopCandidates.length > 0) {
-              candidates = loopCandidates
-            }
-          }
-
-          if (candidates.length === 0) {
-            return emptyClip(clip)
-          }
-
-          const ranked = candidates
-            .map((sample) => ({
+        const ranked = candidates
+          .map((sample) => ({
+            sample,
+            score: scoreSampleCandidate(
               sample,
-              score: scoreSampleCandidate(sample, track, chosenPack, inferredBpm, inferredKey, settings),
-            }))
-            .sort((left, right) => right.score - left.score)
+              track,
+              chosenPack,
+              inferredBpm,
+              inferredKey,
+              settings,
+              usedRelativePaths,
+              usedSampleFamilies,
+            ),
+          }))
+          .filter((entry) => Number.isFinite(entry.score))
+          .sort((left, right) => right.score - left.score)
 
-          const validRanked = ranked.filter((entry) => Number.isFinite(entry.score))
-          if (validRanked.length === 0) {
-            return emptyClip(clip)
-          }
+        const selectedEntry =
+          settings.allowDuplicates && ranked.length > 0
+            ? ranked[clip.sceneIndex % ranked.length]
+            : ranked[0]
 
-          let selectionPool = validRanked
-          if (settings.keyStrictness === 'strict' && inferredKey && !isKeyNeutralTrack(track)) {
-            const exactMatches = validRanked.filter((entry) =>
-              areKeysExactMatch(getSampleEffectiveKey(entry.sample), inferredKey),
-            )
-            if (exactMatches.length > 0) {
-              selectionPool = exactMatches
-            } else if (settings.allowUnknownKeySamples) {
-              const unknownOnly = validRanked.filter((entry) => !getSampleEffectiveKey(entry.sample))
-              if (unknownOnly.length > 0) {
-                selectionPool = unknownOnly
-              }
-            }
-          }
-
-          const selected = selectionPool[clip.sceneIndex % selectionPool.length]?.sample
-          if (!selected) {
-            return emptyClip(clip)
-          }
-
-          const effectiveBpm = getSampleEffectiveBpm(selected, inferredBpm ?? null)
-          const enrichedSample: SampleRecord = {
-            ...selected,
-            bpm: selected.bpm ?? effectiveBpm.bpm,
-            detectedBpm: selected.detectedBpm ?? effectiveBpm.bpm,
-            bpmSource:
-              selected.detectedBpm !== null || selected.bpm !== null
-                ? selected.bpmSource
-                : effectiveBpm.source,
-            syncStatus:
-              selected.detectedBpm !== null || selected.bpm !== null
-                ? selected.syncStatus
-                : effectiveBpm.bpm !== null
-                  ? 'length_uncertain'
-                  : 'bpm_missing',
-          }
-
-          const trackColor = state.tracks[clip.trackIndex]?.color ?? '#64748b'
-          return applySampleToClip(clip, enrichedSample, trackColor)
-        })
-
-        return {
-          clips: nextClips,
-          missingFilesCount: 0,
-          queuedSceneLabel: null,
-          autoFillResolvedSource: source.sourceLabel,
-          autoFillResolvedSourceReason: source.sourceReason,
-          autoFillResolvedKey: inferredKey,
-          autoFillCoverageLabel: coverageLabel,
-          saveStatus: 'dirty',
-          lastAction: `Auto Fill complete (${source.sourceLabel})${inferredBpm ? ` @ ${inferredBpm} BPM` : ''}${inferredKey ? `, ${inferredKey}` : ''}`,
-          playbackEngineStatus: 'Browser playback engine',
+        const selected = selectedEntry?.sample
+        if (!selected) {
+          nextClips.push(emptyClip(clip))
+          continue
         }
-      }),
+
+        if (!settings.allowDuplicates) {
+          usedRelativePaths.add(selected.relativePath)
+          usedSampleFamilies.add(getSampleFamilyKey(selected))
+        }
+
+        const effectiveBpm = getSampleEffectiveBpm(selected, inferredBpm ?? null)
+        const enrichedSample: SampleRecord = {
+          ...selected,
+          bpm: selected.bpm ?? effectiveBpm.bpm,
+          detectedBpm: selected.detectedBpm ?? effectiveBpm.bpm,
+          bpmSource:
+            selected.detectedBpm !== null || selected.bpm !== null
+              ? selected.bpmSource
+              : effectiveBpm.source,
+          syncStatus:
+            selected.detectedBpm !== null || selected.bpm !== null
+              ? selected.syncStatus
+              : effectiveBpm.bpm !== null
+                ? 'length_uncertain'
+                : 'bpm_missing',
+        }
+
+        const trackColor = state.tracks[clip.trackIndex]?.color ?? '#64748b'
+        nextClips.push({
+          ...applySampleToClip(clip, enrichedSample, trackColor),
+          preparationState: 'unloaded',
+          preparationError: null,
+        })
+      }
+
+      const rolesWithoutMatches = state.tracks
+        .filter((track) => !nextClips.some((clip) => clip.trackIndex === track.index && clip.filled))
+        .map((track) => track.label)
+
+      const packBpmCounts = new Map<number, number>()
+      for (const sample of sourceSamples) {
+        const bpmValue = sample.detectedBpm ?? sample.bpm
+        if (bpmValue !== null) {
+          packBpmCounts.set(bpmValue, (packBpmCounts.get(bpmValue) ?? 0) + 1)
+        }
+      }
+      const commonBpm =
+        [...packBpmCounts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? inferredBpm
+      const coveredRoles = state.tracks.filter((track) =>
+        sourceSamples.some((sample) => isRoleCategoryMatch(sample, track)),
+      ).length
+      const usableLoopCount = sourceSamples.filter(
+        (sample) => isLoopLike(sample.type) && isMediumOrHighCategory(sample),
+      ).length
+      const resolvedReason =
+        settings.sourceScope === 'autoBestPack' && chosenPack
+          ? `Auto-selected because it has ${coveredRoles}/${state.tracks.length} roles covered, common BPM ${commonBpm ?? '--'}${inferredKey ? `, key match ${inferredKey}` : ''}, usable loops ${usableLoopCount}.`
+          : source.sourceReason
+
+      set({
+        clips: nextClips,
+        missingFilesCount: 0,
+        queuedSceneLabel: null,
+        autoFillResolvedSource: source.sourceLabel,
+        autoFillResolvedSourceReason: resolvedReason,
+        autoFillResolvedKey: inferredKey,
+        autoFillCoverageLabel: coverageLabel,
+        clipPreparationStatus: settings.preloadGridClips ? buildClipPreparationStatus(nextClips) : null,
+        transportDiagnostics: buildTransportDiagnosticsState(nextClips, state.lastScheduleError),
+        saveStatus: 'dirty',
+        lastAction:
+          rolesWithoutMatches.length > 0
+            ? `Auto Fill complete. No suitable loops found for: ${rolesWithoutMatches.join(', ')}.`
+            : `Auto Fill complete (${source.sourceLabel})${inferredBpm ? ` @ ${inferredBpm} BPM` : ''}${inferredKey ? `, ${inferredKey}` : ''}`,
+        playbackEngineStatus: 'Browser playback engine',
+      })
+
+      if (settings.preloadGridClips) {
+        enqueuePreparationForFilledClips(nextClips)
+      }
+    },
 
     selectClip: (clipId) =>
       set((state) => {
@@ -2729,7 +3372,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       const quantizeNone = state.transport.quantize === 'None'
       if (quantizeNone) {
         if (clip.playing) {
-          stopClipNow(clip, `Clip stopped: ${clip.clipName ?? clip.id}`)
+          stopClipNow(clip, `Stopped: ${truncateStatusLabel(clip.clipName ?? clip.id)}`)
           return
         }
 
@@ -2741,10 +3384,11 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       const boundaryTime = audioTransport.getNextBoundaryTime()
 
       if (clip.launchState === 'queued') {
-        audioTransport.cancelQueuedClipStart(clip.id)
+        audioTransport.cancelQueuedTrackActions(clip.trackIndex)
+        clearPendingTrackLaunch(clip.trackIndex, clip.id)
         set((current) => ({
           clips: current.clips.map((item) =>
-            item.id === clip.id
+            item.trackIndex === clip.trackIndex
               ? {
                   ...item,
                   launchState: item.playing ? 'playing' : item.filled ? 'stopped' : 'empty',
@@ -2792,16 +3436,33 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         return
       }
 
+      const readySceneClips = sceneClips.filter((clip) => clip.preparationState === 'ready')
+      const unreadySceneClips = sceneClips.filter((clip) => clip.preparationState !== 'ready')
+      for (const clip of unreadySceneClips) {
+        if (clip.sampleId && clip.preparationState === 'unloaded') {
+          enqueueClipPreparation(clip.id, clip.sampleId, true)
+        }
+        setPendingTrackLaunch(clip.trackIndex, clip.id, scene?.label ?? `Scene ${sceneIndex + 1}`)
+      }
+
       if (state.transport.quantize === 'None') {
+        if (readySceneClips.length === 0) {
+          set({ lastAction: `Scene ${scene?.label ?? sceneIndex + 1} is still loading` })
+          return
+        }
+
         await ensureTransportForQueuedLaunch()
 
-        for (const sceneClip of sceneClips) {
+        for (const sceneClip of readySceneClips) {
           await startClipNow(sceneClip.id)
         }
 
         set({
           queuedSceneLabel: null,
-          lastAction: `Scene launched: ${scene?.label ?? sceneIndex + 1}`,
+          lastAction:
+            unreadySceneClips.length > 0
+              ? `Scene launched: ${scene?.label ?? sceneIndex + 1} (${unreadySceneClips.length} clips still loading)`
+              : `Scene launched: ${scene?.label ?? sceneIndex + 1}`,
         })
         return
       }
@@ -2810,6 +3471,10 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       const boundaryTime = audioTransport.getNextBoundaryTime()
 
       const sceneClipIds = new Set(sceneClips.map((clip) => clip.id))
+      const readySceneTrackIds = new Set(readySceneClips.map((clip) => clip.trackIndex))
+      for (const clip of readySceneClips) {
+        setPendingTrackLaunch(clip.trackIndex, clip.id, scene?.label ?? `Scene ${sceneIndex + 1}`)
+      }
       set((current) => ({
         clips: current.clips.map((clip) => {
           const sceneClip = sceneClipIds.has(clip.id)
@@ -2829,6 +3494,10 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
             return clip
           }
 
+          if (!readySceneTrackIds.has(clip.trackIndex)) {
+            return clip
+          }
+
           if (clip.launchState === 'queued') {
             return {
               ...clip,
@@ -2836,30 +3505,22 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
             }
           }
 
-          if (clip.playing) {
-            return {
-              ...clip,
-              launchState: 'stopping',
-            }
-          }
-
           return clip
         }),
         queuedSceneLabel: scene?.label ?? `Scene ${sceneIndex + 1}`,
-        lastAction: `Scene queued: ${scene?.label ?? sceneIndex + 1}`,
+        lastAction:
+          unreadySceneClips.length > 0
+            ? `Scene queued: ${scene?.label ?? sceneIndex + 1} (${unreadySceneClips.length} clips still loading)`
+            : `Scene queued: ${scene?.label ?? sceneIndex + 1}`,
       }))
 
       for (const track of state.tracks) {
-        const rowClip = sceneClips.find((clip) => clip.trackIndex === track.index)
+        const rowClip = readySceneClips.find((clip) => clip.trackIndex === track.index)
         if (!rowClip) {
           continue
         }
 
-        for (const clip of state.clips) {
-          if (clip.trackIndex === track.index && clip.launchState === 'queued') {
-            audioTransport.cancelQueuedClipStart(clip.id)
-          }
-        }
+        audioTransport.cancelQueuedTrackActions(track.index)
 
         const currentPlaying = state.clips.filter(
           (clip) => clip.trackIndex === track.index && clip.playing && clip.id !== rowClip.id,
@@ -2896,32 +3557,64 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       }),
 
     toggleTrackArm: (trackId) =>
-      set((state) => ({
-        tracks: state.tracks.map((track) =>
-          track.id === trackId ? { ...track, armed: !track.armed } : track,
-        ),
-        lastAction: `Toggled arm on ${trackId}`,
-      })),
+      set((state) => {
+        const target = state.tracks.find((track) => track.id === trackId)
+        const willArm = !target?.armed
+        return {
+          tracks: state.tracks.map((track) => ({
+            ...track,
+            armed: track.id === trackId ? willArm : false,
+            selected: track.id === trackId,
+          })),
+          lastAction: willArm
+            ? target?.liveInput
+              ? `Armed ${target.label} for future ${target.inputType === 'audio' ? 'audio capture' : 'live input'}`
+              : `Armed ${target?.label ?? trackId} for future capture`
+            : `Disarmed ${target?.label ?? trackId}`,
+        }
+      }),
 
     toggleTrackMute: (trackId) =>
-      set((state) => ({
-        tracks: state.tracks.map((track) =>
+      set((state) => {
+        const nextTracks = state.tracks.map((track) =>
           track.id === trackId ? { ...track, muted: !track.muted } : track,
-        ),
-        lastAction: `Toggled mute on ${trackId}`,
-      })),
+        )
+        syncTrackMixState(nextTracks)
+        const track = nextTracks.find((entry) => entry.id === trackId)
+        return {
+          tracks: nextTracks,
+          lastAction: track?.muted ? `Muted: ${track.label}` : `Unmuted: ${track?.label ?? trackId}`,
+        }
+      }),
 
     toggleTrackSolo: (trackId) =>
-      set((state) => ({
-        tracks: state.tracks.map((track) =>
+      set((state) => {
+        const nextTracks = state.tracks.map((track) =>
           track.id === trackId ? { ...track, solo: !track.solo } : track,
-        ),
-        lastAction: `Toggled solo on ${trackId}`,
-      })),
+        )
+        syncTrackMixState(nextTracks)
+        const activeSoloCount = nextTracks.filter((track) => track.solo).length
+        const track = nextTracks.find((entry) => entry.id === trackId)
+        return {
+          tracks: nextTracks,
+          lastAction:
+            track?.solo
+              ? `Solo: ${track.label}${activeSoloCount > 1 ? ` (${activeSoloCount} tracks soloed)` : ''}`
+              : activeSoloCount > 0
+                ? `Solo updated: ${activeSoloCount} tracks soloed`
+                : 'Solo cleared',
+        }
+      }),
 
-    stopTrack: (trackIndex) => {
+    stopTrack: (trackId) => {
       const state = get()
+      const track = state.tracks.find((entry) => entry.id === trackId)
+      if (!track) {
+        return
+      }
+      const trackIndex = track.index
       const trackLabel = getTrackLabel(state.tracks, trackIndex)
+      clearPendingTrackLaunch(trackIndex)
 
       if (state.transport.quantize === 'None' || !state.transport.isPlaying) {
         stopTrackNow(trackIndex)
@@ -2935,7 +3628,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
         }
 
         if (clip.launchState === 'queued') {
-          audioTransport.cancelQueuedClipStart(clip.id)
+          audioTransport.cancelQueuedTrackActions(trackIndex)
         }
 
         if (!clip.playing && clip.launchState !== 'stopping') {
@@ -2953,6 +3646,9 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       }
 
       set((current) => ({
+        tracks: current.tracks.map((entry) =>
+          entry.index === trackIndex ? { ...entry, queuedClipId: null } : entry,
+        ),
         clips: current.clips.map((clip) => {
           if (clip.trackIndex !== trackIndex) {
             return clip
@@ -3016,6 +3712,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       const rowLabel = state.scenes.find((scene) => scene.index === sceneIndex)?.label ?? `Row ${sceneIndex + 1}`
       const rowClips = state.clips.filter((clip) => clip.sceneIndex === sceneIndex)
       for (const clip of rowClips) {
+        clearPendingTrackLaunch(clip.trackIndex, clip.id)
         if (!clip.playing) {
           continue
         }
@@ -3032,6 +3729,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       const nextClips = state.clips.map((clip) => (clip.sceneIndex === sceneIndex ? emptyClip(clip) : clip))
       set({
         clips: nextClips,
+        clipPreparationStatus: buildClipPreparationStatus(nextClips),
+        transportDiagnostics: buildTransportDiagnosticsState(nextClips, state.lastScheduleError),
         missingFilesCount: nextClips.filter((clip) => clip.filled && clip.missingFile).length,
         lastClearSnapshot: snapshot,
         canUndoClear: true,
@@ -3045,6 +3744,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       const snapshot = createClearSnapshot(state, 'Undo clear column')
       const columnLabel = getTrackLabel(state.tracks, trackIndex)
       const columnClips = state.clips.filter((clip) => clip.trackIndex === trackIndex)
+      clearPendingTrackLaunch(trackIndex)
       for (const clip of columnClips) {
         if (!clip.playing) {
           continue
@@ -3062,6 +3762,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       const nextClips = state.clips.map((clip) => (clip.trackIndex === trackIndex ? emptyClip(clip) : clip))
       set({
         clips: nextClips,
+        clipPreparationStatus: buildClipPreparationStatus(nextClips),
+        transportDiagnostics: buildTransportDiagnosticsState(nextClips, state.lastScheduleError),
         missingFilesCount: nextClips.filter((clip) => clip.filled && clip.missingFile).length,
         lastClearSnapshot: snapshot,
         canUndoClear: true,
@@ -3073,11 +3775,14 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
     clearAllGrid: () => {
       const state = get()
       const snapshot = createClearSnapshot(state, 'Undo clear all')
+      clearAllPendingTrackLaunches()
       audioTransport.stopAll()
 
       const nextClips = state.clips.map((clip) => emptyClip(clip))
       set({
         clips: nextClips,
+        clipPreparationStatus: null,
+        transportDiagnostics: buildTransportDiagnosticsState(nextClips, state.lastScheduleError),
         missingFilesCount: 0,
         lastClearSnapshot: snapshot,
         canUndoClear: true,
@@ -3115,6 +3820,8 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
       const nextClips = state.clips.map((clip) => (missingSet.has(clip.id) ? emptyClip(clip) : clip))
       set({
         clips: nextClips,
+        clipPreparationStatus: buildClipPreparationStatus(nextClips),
+        transportDiagnostics: buildTransportDiagnosticsState(nextClips, state.lastScheduleError),
         missingFilesCount: 0,
         lastClearSnapshot: snapshot,
         canUndoClear: true,
@@ -3146,12 +3853,15 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
       set({
         clips: snapshot.clips.map((clip) => ({ ...clip })),
+        clipPreparationStatus: buildClipPreparationStatus(snapshot.clips),
+        transportDiagnostics: buildTransportDiagnosticsState(snapshot.clips, get().lastScheduleError),
         missingFilesCount: snapshot.missingFilesCount,
         lastClearSnapshot: null,
         canUndoClear: false,
         saveStatus: 'dirty',
         lastAction: 'Undo clear applied',
       })
+      enqueuePreparationForFilledClips(snapshot.clips)
     },
 
     setAssistantInput: (value) => set({ assistantInput: value }),
@@ -3182,7 +3892,7 @@ export const useLaunchBrainStore = create<LaunchBrainState>((set, get) => {
 
     runAssistantQuickAction: (action) => {
       if (action === 'Auto Group' || action === 'Suggest Layout' || action === 'Build Scene') {
-        get().autoFillGrid()
+        void get().autoFillGrid()
       }
 
       const { assistantMessages } = get()

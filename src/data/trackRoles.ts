@@ -207,6 +207,9 @@ export function buildTracksFromRoleOrder(
       muted: false,
       solo: false,
       selected: selectedTrackRole ? role === selectedTrackRole : index === 0,
+      volume: 1,
+      playingClipId: null,
+      queuedClipId: null,
     }
   })
 }

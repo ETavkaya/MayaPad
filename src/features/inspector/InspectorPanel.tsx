@@ -100,6 +100,11 @@ export function InspectorPanel() {
   const clearAllGrid = useLaunchBrainStore((state) => state.clearAllGrid)
   const removeMissingClips = useLaunchBrainStore((state) => state.removeMissingClips)
   const undoLastClear = useLaunchBrainStore((state) => state.undoLastClear)
+  const selectTrack = useLaunchBrainStore((state) => state.selectTrack)
+  const toggleTrackArm = useLaunchBrainStore((state) => state.toggleTrackArm)
+  const toggleTrackMute = useLaunchBrainStore((state) => state.toggleTrackMute)
+  const toggleTrackSolo = useLaunchBrainStore((state) => state.toggleTrackSolo)
+  const stopTrack = useLaunchBrainStore((state) => state.stopTrack)
 
   const selectedClip = useMemo(() => clips.find((clip) => clip.id === selectedClipId), [clips, selectedClipId])
   const selectedTrack = useMemo(() => tracks.find((track) => track.selected) ?? tracks[0], [tracks])
@@ -114,6 +119,8 @@ export function InspectorPanel() {
         ? {
             filename: selectedClip.clipName,
             category: selectedClip.category,
+            categoryConfidence: selectedClip.categoryConfidence,
+            categorySource: selectedClip.categorySource,
             type: selectedClip.type,
             bpm: selectedClip.bpm,
             detectedBpm: selectedClip.detectedBpm,
@@ -131,11 +138,23 @@ export function InspectorPanel() {
             beatsLength: selectedClip.beatsLength,
             syncStatus: selectedClip.syncStatus,
             playbackRate: selectedClip.playbackRate,
+            subtype: selectedClip.subtype,
+            role: selectedClip.role,
+            sessionSuitability: selectedClip.sessionSuitability,
+            semanticTags: selectedClip.semanticTags,
+            moodTags: selectedClip.moodTags,
+            instrumentationTags: selectedClip.instrumentationTags,
+            sourceContext: selectedClip.sourceContext,
+            classificationReason: selectedClip.classificationReason,
+            preparationState: selectedClip.preparationState,
+            preparationError: selectedClip.preparationError,
           }
         : selectedSample
           ? {
               filename: selectedSample.filename,
               category: selectedSample.category,
+              categoryConfidence: selectedSample.categoryConfidence,
+              categorySource: selectedSample.categorySource,
               type: selectedSample.type,
               bpm: selectedSample.bpm,
               detectedBpm: selectedSample.detectedBpm,
@@ -153,6 +172,16 @@ export function InspectorPanel() {
               beatsLength: selectedSample.beatsLength,
               syncStatus: selectedSample.syncStatus,
               playbackRate: selectedSample.playbackRate,
+              subtype: selectedSample.subtype,
+              role: selectedSample.role,
+              sessionSuitability: selectedSample.sessionSuitability,
+              semanticTags: selectedSample.semanticTags,
+              moodTags: selectedSample.moodTags,
+              instrumentationTags: selectedSample.instrumentationTags,
+              sourceContext: selectedSample.sourceContext,
+              classificationReason: selectedSample.classificationReason,
+              preparationState: 'unloaded',
+              preparationError: null,
             }
           : null,
     [selectedClip, selectedSample],
@@ -186,6 +215,15 @@ export function InspectorPanel() {
       clipWarnings.push('Manual metadata override is active for key.')
     }
   }
+
+  const selectedTrackCurrentClip = selectedTrack.playingClipId
+    ? clips.find((clip) => clip.id === selectedTrack.playingClipId) ?? null
+    : null
+  const selectedTrackQueuedClip = selectedTrack.queuedClipId
+    ? clips.find((clip) => clip.id === selectedTrack.queuedClipId) ?? null
+    : null
+  const selectedTrackActiveClip =
+    selectedClip && selectedClip.trackIndex === selectedTrack.index ? selectedClip : null
 
   return (
     <section className="rounded-xl border border-slate-800 bg-slate-950/80">
@@ -257,6 +295,12 @@ export function InspectorPanel() {
                     <Field label="Category">
                       <InputLike value={activeSample.category ?? ''} readOnly />
                     </Field>
+                    <Field label="Category Confidence">
+                      <InputLike value={activeSample.categoryConfidence ?? 'low'} readOnly />
+                    </Field>
+                    <Field label="Category Source">
+                      <InputLike value={activeSample.categorySource ?? 'unknown'} readOnly />
+                    </Field>
                     <Field label="Type">
                       <InputLike value={activeSample.type ?? ''} readOnly />
                     </Field>
@@ -309,6 +353,9 @@ export function InspectorPanel() {
                     <Field label="Sync Status">
                       <InputLike value={activeSample.syncStatus ?? 'unsupported'} readOnly />
                     </Field>
+                    <Field label="Preparation">
+                      <InputLike value={activeSample.preparationState ?? 'unloaded'} readOnly />
+                    </Field>
                     <Field label="Playback Rate">
                       <InputLike
                         value={
@@ -325,13 +372,31 @@ export function InspectorPanel() {
                     <Field label="Source Pack">
                       <InputLike value={sourcePack ?? ''} readOnly />
                     </Field>
+                    <Field label="Session Suitability">
+                      <InputLike value={activeSample.sessionSuitability ?? 'low'} readOnly />
+                    </Field>
+                    <Field label="Semantic Role">
+                      <InputLike value={activeSample.role ?? ''} readOnly />
+                    </Field>
+                    <Field label="Subtype">
+                      <InputLike value={activeSample.subtype ?? ''} readOnly />
+                    </Field>
                     <Field label="Absolute Path">
                       <InputLike value={activeSample.absolutePath ?? ''} readOnly />
                     </Field>
-                      <Field label="Notes / Metadata">
-                        <InputLike defaultValue="Metadata from scanned file index." />
-                      </Field>
-                    </div>
+                    <Field label="Semantic Tags">
+                      <InputLike value={(activeSample.semanticTags ?? []).join(', ')} readOnly />
+                    </Field>
+                    <Field label="Mood Tags">
+                      <InputLike value={(activeSample.moodTags ?? []).join(', ')} readOnly />
+                    </Field>
+                    <Field label="Classification Reason">
+                      <InputLike value={activeSample.classificationReason ?? ''} readOnly />
+                    </Field>
+                    <Field label="Notes / Metadata">
+                      <InputLike defaultValue="Metadata from semantic scanner/index." />
+                    </Field>
+                  </div>
                   </div>
                   {clipWarnings.length > 0 && (
                     <div className="xl:col-span-4 space-y-1 rounded-md border border-amber-500/35 bg-amber-500/10 p-2">
@@ -383,36 +448,105 @@ export function InspectorPanel() {
           )}
 
           {inspectorTab === 'Track' && (
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-              <Field label="Record Arm">
-                <SelectLike value={selectedTrack.armed ? 'On' : 'Off'} onChange={() => undefined}>
-                  <option>On</option>
-                  <option>Off</option>
-                </SelectLike>
-              </Field>
-              <Field label="Input Monitor">
-                <SelectLike defaultValue="Auto">
-                  <option>Auto</option>
-                  <option>In</option>
-                  <option>Off</option>
-                </SelectLike>
-              </Field>
-              <Field label="Output">
-                <SelectLike defaultValue="Master">
-                  <option>Master</option>
-                  <option>Bus A</option>
-                  <option>Bus B</option>
-                </SelectLike>
-              </Field>
-              <Field label="Track Color">
-                <InputLike value={selectedTrack.color} readOnly />
-              </Field>
-              <Field label="Send Level">
-                <InputLike defaultValue="12%" />
-              </Field>
-              <Field label="Selected Instrument">
-                <InputLike defaultValue="Sampler Rack" />
-              </Field>
+            <div className="space-y-3">
+              <div className="flex flex-wrap gap-1.5 rounded-md border border-slate-800 bg-slate-900/35 p-2">
+                <button
+                  type="button"
+                  onClick={() => selectTrack(selectedTrack.id)}
+                  className="rounded border border-slate-700 px-2 py-1 text-[11px] text-slate-200 transition hover:border-slate-500"
+                >
+                  Select Track
+                </button>
+                <button
+                  type="button"
+                  onClick={() => toggleTrackArm(selectedTrack.id)}
+                  className={cn(
+                    'rounded border px-2 py-1 text-[11px] transition',
+                    selectedTrack.armed
+                      ? 'border-rose-400/70 bg-rose-500/20 text-rose-200'
+                      : 'border-slate-700 text-slate-200 hover:border-slate-500',
+                  )}
+                >
+                  {selectedTrack.armed ? 'Disarm' : 'Arm'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => toggleTrackSolo(selectedTrack.id)}
+                  className={cn(
+                    'rounded border px-2 py-1 text-[11px] transition',
+                    selectedTrack.solo
+                      ? 'border-sky-400/70 bg-sky-500/20 text-sky-200'
+                      : 'border-slate-700 text-slate-200 hover:border-slate-500',
+                  )}
+                >
+                  {selectedTrack.solo ? 'Unsolo' : 'Solo'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => toggleTrackMute(selectedTrack.id)}
+                  className={cn(
+                    'rounded border px-2 py-1 text-[11px] transition',
+                    selectedTrack.muted
+                      ? 'border-amber-400/70 bg-amber-500/20 text-amber-100'
+                      : 'border-slate-700 text-slate-200 hover:border-slate-500',
+                  )}
+                >
+                  {selectedTrack.muted ? 'Unmute' : 'Mute'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => stopTrack(selectedTrack.id)}
+                  className="rounded border border-slate-700 px-2 py-1 text-[11px] text-slate-200 transition hover:border-slate-500"
+                >
+                  Stop Column
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+                <Field label="Track Role / Name">
+                  <InputLike value={`${selectedTrack.label} (${selectedTrack.role})`} readOnly />
+                </Field>
+                <Field label="Arm State">
+                  <InputLike value={selectedTrack.armed ? 'Armed' : 'Off'} readOnly />
+                </Field>
+                <Field label="Solo State">
+                  <InputLike value={selectedTrack.solo ? 'Soloed' : 'Off'} readOnly />
+                </Field>
+                <Field label="Mute State">
+                  <InputLike value={selectedTrack.muted ? 'Muted' : 'Audible'} readOnly />
+                </Field>
+                <Field label="Selected Active Clip">
+                  <InputLike value={selectedTrackActiveClip?.clipName ?? 'None selected on this track'} readOnly />
+                </Field>
+                <Field label="Current Playing Clip">
+                  <InputLike value={selectedTrackCurrentClip?.clipName ?? 'Nothing playing'} readOnly />
+                </Field>
+                <Field label="Queued Clip">
+                  <InputLike value={selectedTrackQueuedClip?.clipName ?? 'No queued launch'} readOnly />
+                </Field>
+                <Field label="Accepted Categories">
+                  <InputLike value={selectedTrack.acceptedCategories.join(', ')} readOnly />
+                </Field>
+                <Field label="Future Input Type">
+                  <InputLike
+                    value={
+                      selectedTrack.liveInput
+                        ? `${selectedTrack.inputType ?? 'live'}${selectedTrack.futureDevice ? ` - ${selectedTrack.futureDevice}` : ''}`
+                        : 'Sample playback only'
+                    }
+                    readOnly
+                  />
+                </Field>
+                <Field label="Volume">
+                  <InputLike value={`${Math.round(selectedTrack.volume * 100)}%`} readOnly />
+                </Field>
+                <Field label="Output">
+                  <InputLike value="Browser playback engine" readOnly />
+                </Field>
+                <Field label="Track Color">
+                  <InputLike value={selectedTrack.color} readOnly />
+                </Field>
+              </div>
             </div>
           )}
 
@@ -645,6 +779,10 @@ export function InspectorPanel() {
                       </p>
                       <p>Queued events: {transportDiagnostics.queuedEventsCount}</p>
                       <p>Playing clips: {transportDiagnostics.playingClipsCount}</p>
+                      <p>Loading clips: {transportDiagnostics.loadingClipsCount}</p>
+                      <p>Ready clips: {transportDiagnostics.readyClipsCount}</p>
+                      <p>Failed clips: {transportDiagnostics.failedClipsCount}</p>
+                      <p>Last schedule error: {transportDiagnostics.lastScheduleError ?? '--'}</p>
                     </div>
                   </details>
                 ) : null}

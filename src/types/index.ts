@@ -46,8 +46,12 @@ export type BpmSource = 'filename' | 'estimated' | 'manual' | 'unknown'
 export type ClipSyncStatus = 'ready' | 'bpm_missing' | 'length_uncertain' | 'unsupported'
 export type KeySource = 'filename' | 'folder' | 'manual' | 'analysis' | 'unknown'
 export type KeyConfidence = 'high' | 'medium' | 'low'
+export type CategoryConfidence = 'high' | 'medium' | 'low'
+export type CategorySource = 'filename' | 'folder' | 'manual' | 'unknown'
+export type ClipPreparationState = 'unloaded' | 'loading' | 'ready' | 'failed'
 export type TrackInputType = 'midi' | 'audio' | null
 export type TrackLaunchRule = 'oneClipPerColumn'
+export type SessionSuitability = 'high' | 'medium' | 'low' | 'ignore'
 
 export interface TransportState {
   isPlaying: boolean
@@ -97,7 +101,11 @@ export interface SampleRecord {
   filename: string
   absolutePath: string
   relativePath: string
+  extension?: string
+  sizeBytes?: number | null
   category: string
+  categoryConfidence: CategoryConfidence
+  categorySource: CategorySource
   bpm: number | null
   detectedBpm: number | null
   bpmSource: BpmSource
@@ -115,6 +123,16 @@ export interface SampleRecord {
   beatsLength: number | null
   syncStatus: ClipSyncStatus
   playbackRate: number | null
+  subtype?: string | null
+  role?: string | null
+  sessionSuitability?: SessionSuitability
+  ignored?: boolean
+  ignoredReason?: string | null
+  semanticTags?: string[]
+  moodTags?: string[]
+  instrumentationTags?: string[]
+  sourceContext?: Record<string, unknown> | null
+  classificationReason?: string | null
   tags: string[]
 }
 
@@ -148,6 +166,8 @@ export interface AutoFillSettings {
   keyStrictness: KeyStrictness
   allowUnknownKeySamples: boolean
   allowKeyNeutralStrict: boolean
+  allowDuplicates: boolean
+  preloadGridClips: boolean
   preferLoops: boolean
   allowOneShotsInFXOnly: boolean
   preferSameFolder: boolean
@@ -199,6 +219,9 @@ export interface Track {
   muted: boolean
   solo: boolean
   selected: boolean
+  volume: number
+  playingClipId: string | null
+  queuedClipId: string | null
 }
 
 export interface ClipSlot {
@@ -209,6 +232,8 @@ export interface ClipSlot {
   sampleId: string | null
   clipName: string | null
   category: string | null
+  categoryConfidence: CategoryConfidence
+  categorySource: CategorySource
   type: SampleType | null
   bpm: number | null
   key: string | null
@@ -226,6 +251,16 @@ export interface ClipSlot {
   beatsLength: number | null
   syncStatus: ClipSyncStatus
   playbackRate: number | null
+  subtype?: string | null
+  role?: string | null
+  sessionSuitability?: SessionSuitability
+  semanticTags?: string[]
+  moodTags?: string[]
+  instrumentationTags?: string[]
+  sourceContext?: Record<string, unknown> | null
+  classificationReason?: string | null
+  preparationState: ClipPreparationState
+  preparationError: string | null
   color: string | null
   playing: boolean
   launchState: ClipLaunchState
@@ -264,6 +299,8 @@ export interface SessionManifestClip {
   absolutePath: string | null
   relativePath: string | null
   category: string | null
+  categoryConfidence?: CategoryConfidence
+  categorySource?: CategorySource
   type: SampleType | null
   bpm: number | null
   key: string | null
@@ -279,6 +316,14 @@ export interface SessionManifestClip {
   beatsLength?: number | null
   syncStatus?: ClipSyncStatus
   playbackRate?: number | null
+  subtype?: string | null
+  role?: string | null
+  sessionSuitability?: SessionSuitability
+  semanticTags?: string[]
+  moodTags?: string[]
+  instrumentationTags?: string[]
+  sourceContext?: Record<string, unknown> | null
+  classificationReason?: string | null
   color: string | null
   missingFile?: boolean
 }
@@ -318,4 +363,8 @@ export interface TransportDiagnostics {
   nextBoundaryTime: number | null
   queuedEventsCount: number
   playingClipsCount: number
+  loadingClipsCount: number
+  readyClipsCount: number
+  failedClipsCount: number
+  lastScheduleError: string | null
 }

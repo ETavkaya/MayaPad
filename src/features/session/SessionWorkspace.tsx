@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   AudioWaveform,
   ChevronLeft,
   ChevronRight,
@@ -67,6 +68,7 @@ export function SessionWorkspace() {
   const autoFillResolvedSourceReason = useLaunchBrainStore((state) => state.autoFillResolvedSourceReason)
   const autoFillResolvedKey = useLaunchBrainStore((state) => state.autoFillResolvedKey)
   const autoFillCoverageLabel = useLaunchBrainStore((state) => state.autoFillCoverageLabel)
+  const clipPreparationStatus = useLaunchBrainStore((state) => state.clipPreparationStatus)
   const layoutPresetName = useLaunchBrainStore((state) => state.layoutPresetName)
   const canUndoClear = useLaunchBrainStore((state) => state.canUndoClear)
 
@@ -106,6 +108,16 @@ export function SessionWorkspace() {
   const sampleById = useMemo(() => {
     return new Map(samples.map((sample) => [sample.id, sample]))
   }, [samples])
+  const anySoloActive = useMemo(() => tracks.some((track) => track.solo), [tracks])
+
+  const getClipDisplayName = (value: string | null) => {
+    if (!value) {
+      return 'Unnamed Clip'
+    }
+
+    const withoutExtension = value.replace(/\.[^.]+$/, '')
+    return withoutExtension.length > 0 ? withoutExtension : value
+  }
   const keyScopeSamples = useMemo(() => {
     const query = browserQuery.trim().toLowerCase()
 
@@ -416,6 +428,24 @@ export function SessionWorkspace() {
               <label className="flex items-center gap-2 text-xs text-slate-300">
                 <input
                   type="checkbox"
+                  checked={autoFillSettings.allowDuplicates}
+                  onChange={(event) => setAutoFillSettings({ allowDuplicates: event.target.checked })}
+                />
+                Allow duplicates
+              </label>
+
+              <label className="flex items-center gap-2 text-xs text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={autoFillSettings.preloadGridClips}
+                  onChange={(event) => setAutoFillSettings({ preloadGridClips: event.target.checked })}
+                />
+                Preload grid clips
+              </label>
+
+              <label className="flex items-center gap-2 text-xs text-slate-300">
+                <input
+                  type="checkbox"
                   checked={autoFillSettings.allowOneShotsInFXOnly}
                   onChange={(event) =>
                     setAutoFillSettings({ allowOneShotsInFXOnly: event.target.checked })
@@ -438,6 +468,9 @@ export function SessionWorkspace() {
         {autoFillResolvedSourceReason ? (
           <span className="ml-3 text-slate-500">{autoFillResolvedSourceReason}</span>
         ) : null}
+        {clipPreparationStatus ? (
+          <span className="ml-3 text-slate-400">{clipPreparationStatus}</span>
+        ) : null}
       </div>
 
       <div className="border-b border-slate-800/70 px-3 py-2">
@@ -445,6 +478,7 @@ export function SessionWorkspace() {
           <div></div>
           {tracks.map((track, index) => {
             const Icon = TRACK_ICON_MAP[track.icon] ?? Music2
+            const isTrackAudible = !track.muted && (!anySoloActive || track.solo)
 
             return (
               <div
@@ -452,6 +486,7 @@ export function SessionWorkspace() {
                 className={cn(
                   'grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1 rounded-md border border-slate-800 bg-slate-900 px-1 py-1 transition',
                   track.selected && 'border-slate-500 bg-slate-800',
+                  !isTrackAudible && 'opacity-55',
                 )}
               >
                 <button
@@ -471,6 +506,7 @@ export function SessionWorkspace() {
                       LIVE
                     </span>
                   )}
+                  {track.armed && <span className="h-1.5 w-1.5 rounded-full bg-rose-400 shadow-[0_0_10px_rgba(251,113,133,0.9)]" />}
                 </button>
                 <div className="inline-flex items-center gap-0.5">
                   <button
@@ -520,6 +556,7 @@ export function SessionWorkspace() {
                 const slot = clips.find(
                   (clip) => clip.sceneIndex === scene.index && clip.trackIndex === track.index,
                 )
+                const isTrackAudible = !track.muted && (!anySoloActive || track.solo)
 
                 if (!slot) {
                   return <div key={`${scene.id}-${track.id}`} />
@@ -591,6 +628,7 @@ export function SessionWorkspace() {
                       slot.launchState === 'stopping' && 'clip-stopping',
                       slot.missingFile && 'border-amber-500/70 bg-amber-500/10',
                       dragOverClipId === slot.id && 'ring-1 ring-emerald-300',
+                      !isTrackAudible && 'opacity-45 saturate-50',
                     )}
                     style={{
                       boxShadow:
@@ -601,16 +639,26 @@ export function SessionWorkspace() {
                   >
                     {slot.filled ? (
                       <div
-                        className="flex h-full min-h-0 flex-col justify-between rounded-md px-2 py-1.5"
+                        className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_auto_auto] gap-1 rounded-md px-2 py-1.5"
                         style={{
                           backgroundColor: `${track.color}22`,
                         }}
                       >
-                        <p className="truncate text-[10px] font-medium text-white">{slot.clipName}</p>
-                        <div className="flex items-center gap-1">
+                        <p
+                          className="min-h-[1rem] truncate self-start leading-tight text-[11px] font-medium text-white/95"
+                          title={slot.clipName ?? undefined}
+                        >
+                          {getClipDisplayName(slot.clipName)}
+                        </p>
+                        <div className="flex min-w-0 items-center gap-1">
                           <span className="rounded border border-white/20 px-1 py-0.5 text-[9px] uppercase tracking-wide text-white/80">
                             {slot.type}
                           </span>
+                          {slot.preparationState === 'failed' && (
+                            <span className="inline-flex items-center text-rose-300" title={slot.preparationError ?? 'Clip failed to load'}>
+                              <AlertTriangle className="h-3 w-3" />
+                            </span>
+                          )}
                           {slot.launchState === 'queued' && (
                             <span className="text-[9px] uppercase tracking-wide text-sky-200">Queued</span>
                           )}
@@ -624,7 +672,7 @@ export function SessionWorkspace() {
                             <span className="text-[9px] uppercase tracking-wide text-amber-200">Missing</span>
                           )}
                         </div>
-                        <p className="truncate text-[10px] text-slate-200">
+                        <p className="truncate leading-tight text-[9px] text-slate-200">
                           {slot.bpm ?? '--'} BPM - {slot.normalizedKey ?? slot.key ?? '--'}
                         </p>
                       </div>
@@ -653,8 +701,17 @@ export function SessionWorkspace() {
       <div className="border-t border-slate-800/70 px-3 py-2">
         <div className="grid grid-cols-[68px_repeat(8,minmax(0,1fr))_56px] gap-1">
           <div className="text-center text-[11px] text-slate-400">Track Ctl</div>
-          {tracks.map((track) => (
-            <div key={track.id} className="rounded-md border border-slate-800 bg-slate-900/90 px-1.5 py-1.5">
+          {tracks.map((track) => {
+            const isTrackAudible = !track.muted && (!anySoloActive || track.solo)
+            return (
+            <div
+              key={track.id}
+              className={cn(
+                'rounded-md border border-slate-800 bg-slate-900/90 px-1.5 py-1.5',
+                !isTrackAudible && 'opacity-60',
+                track.selected && 'border-slate-500',
+              )}
+            >
               <div className="mb-1 grid grid-cols-2 gap-1">
                 <button
                   type="button"
@@ -670,7 +727,7 @@ export function SessionWorkspace() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => stopTrack(track.index)}
+                  onClick={() => stopTrack(track.id)}
                   className="rounded border border-slate-700 px-1 py-0.5 text-[10px] text-slate-300 transition hover:border-slate-500"
                 >
                   <Square className="mx-auto h-3 w-3" />
@@ -683,7 +740,7 @@ export function SessionWorkspace() {
                   className={cn(
                     'rounded border px-1 py-0.5 text-[10px] transition',
                     track.solo
-                      ? 'border-amber-400/70 bg-amber-500/20 text-amber-200'
+                      ? 'border-sky-400/70 bg-sky-500/20 text-sky-200'
                       : 'border-slate-700 text-slate-300 hover:border-slate-500',
                   )}
                 >
@@ -695,7 +752,7 @@ export function SessionWorkspace() {
                   className={cn(
                     'rounded border px-1 py-0.5 text-[10px] transition',
                     track.muted
-                      ? 'border-slate-400/70 bg-slate-600/40 text-slate-100'
+                      ? 'border-amber-400/70 bg-amber-500/20 text-amber-100'
                       : 'border-slate-700 text-slate-300 hover:border-slate-500',
                   )}
                 >
@@ -703,7 +760,7 @@ export function SessionWorkspace() {
                 </button>
               </div>
             </div>
-          ))}
+          )})}
           <div className="rounded-md border border-slate-800 bg-slate-900"></div>
         </div>
       </div>
